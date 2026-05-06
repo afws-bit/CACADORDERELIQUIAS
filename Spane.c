@@ -24,7 +24,7 @@
 #define MAP_HEIGHT    18
 #define PLAYER_SPEED  5
 
-#define WEB_PORT 8080
+#define WEB_PORT 3000
 
 // 5x7 bitmap font (ASCII 32-126)
 static const unsigned char font_5x7[][5] = {
