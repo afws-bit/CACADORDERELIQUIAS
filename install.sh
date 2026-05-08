@@ -24,10 +24,8 @@ MAIN_FILE="Spane.c"
 BINARY_NAME="spane"
 BUILD_DIR="/tmp/spane_build_$$"
 
-# Installation mode (default: full, --web: skip X11)
 WEB_MODE=false
 
-# Detect if we need sudo
 if [ "$(id -u)" = "0" ]; then
     SUDO=""
 else
@@ -35,25 +33,20 @@ else
 fi
 
 # =============================================================================
-# FUNCTION DEFINITIONS
+# FUNCTIONS
 # =============================================================================
 
 log_message() {
-    message="$1"
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] $message"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
-# Check if a command exists
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# Install GCC and standard libraries
 install_build_tools() {
     log_message "Checking build tools..."
     
-    # Test if we can compile
     if command_exists gcc; then
         echo 'int main(){return 0;}' > /tmp/spane_test.c
         if gcc /tmp/spane_test.c -o /tmp/spane_test 2>/dev/null; then
@@ -67,69 +60,36 @@ install_build_tools() {
     
     log_message "Installing build tools..."
     
-    # Alpine Linux (apk)
     if command_exists apk; then
         log_message "Detected Alpine Linux"
-        if $SUDO apk update 2>/dev/null && $SUDO apk add build-base 2>/dev/null; then
-            log_message "✓ Build tools installed via apk"
-            return 0
-        fi
-        # Try just musl-dev and gcc
-        if $SUDO apk add gcc musl-dev 2>/dev/null; then
-            log_message "✓ Minimal build tools installed"
-            return 0
-        fi
+        $SUDO apk update 2>/dev/null && $SUDO apk add build-base 2>/dev/null && { log_message "✓ Build tools installed"; return 0; }
+        $SUDO apk add gcc musl-dev 2>/dev/null && { log_message "✓ Minimal build tools installed"; return 0; }
         log_message "✗ Failed to install via apk"
         exit 1
     fi
     
-    # Debian/Ubuntu (apt-get)
     if command_exists apt-get; then
-        log_message "Detected APT"
-        if $SUDO apt-get update -y 2>/dev/null && $SUDO apt-get install -y gcc build-essential 2>/dev/null; then
-            log_message "✓ Build tools installed via apt-get"
-            return 0
-        fi
+        $SUDO apt-get update -y 2>/dev/null && $SUDO apt-get install -y gcc build-essential 2>/dev/null && { log_message "✓ Build tools installed"; return 0; }
         exit 1
     fi
     
-    # Fedora/RHEL (dnf)
     if command_exists dnf; then
-        log_message "Detected DNF"
-        if $SUDO dnf install -y gcc make 2>/dev/null; then
-            log_message "✓ Build tools installed via dnf"
-            return 0
-        fi
+        $SUDO dnf install -y gcc make 2>/dev/null && { log_message "✓ Build tools installed"; return 0; }
         exit 1
     fi
     
-    # CentOS/RHEL 7 (yum)
     if command_exists yum; then
-        log_message "Detected YUM"
-        if $SUDO yum install -y gcc make 2>/dev/null; then
-            log_message "✓ Build tools installed via yum"
-            return 0
-        fi
+        $SUDO yum install -y gcc make 2>/dev/null && { log_message "✓ Build tools installed"; return 0; }
         exit 1
     fi
     
-    # Arch (pacman)
     if command_exists pacman; then
-        log_message "Detected Pacman"
-        if $SUDO pacman -S --noconfirm base-devel 2>/dev/null; then
-            log_message "✓ Build tools installed via pacman"
-            return 0
-        fi
+        $SUDO pacman -S --noconfirm base-devel 2>/dev/null && { log_message "✓ Build tools installed"; return 0; }
         exit 1
     fi
     
-    # openSUSE (zypper)
     if command_exists zypper; then
-        log_message "Detected Zypper"
-        if $SUDO zypper install -y gcc make 2>/dev/null; then
-            log_message "✓ Build tools installed via zypper"
-            return 0
-        fi
+        $SUDO zypper install -y gcc make 2>/dev/null && { log_message "✓ Build tools installed"; return 0; }
         exit 1
     fi
     
@@ -137,16 +97,15 @@ install_build_tools() {
     exit 1
 }
 
-# Install X11 development libraries (optional)
 install_x11_libs() {
-    log_message "Checking X11 development libraries..."
+    log_message "Checking X11 libraries..."
     
     if [ -f "/usr/include/X11/Xlib.h" ] || [ -f "/usr/local/include/X11/Xlib.h" ]; then
         log_message "✓ X11 found"
         return 0
     fi
     
-    log_message "Installing X11 libraries..."
+    log_message "Installing X11..."
     
     if command_exists apk; then
         $SUDO apk add libx11-dev 2>/dev/null
@@ -158,108 +117,145 @@ install_x11_libs() {
         $SUDO yum install -y libX11-devel 2>/dev/null
     elif command_exists pacman; then
         $SUDO pacman -S --noconfirm libx11 2>/dev/null
-    elif command_exists zypper; then
-        $SUDO zypper install -y libX11-devel 2>/dev/null
     fi
     
-    if [ -f "/usr/include/X11/Xlib.h" ]; then
-        log_message "✓ X11 libraries installed"
-        return 0
-    fi
-    
-    log_message "⚠ X11 not available - will build web-only version"
+    [ -f "/usr/include/X11/Xlib.h" ] && { log_message "✓ X11 installed"; return 0; }
+    log_message "⚠ No X11 - web-only build"
     return 1
 }
 
-# Check if X11 headers are available
 has_x11() {
     [ -f "/usr/include/X11/Xlib.h" ] || [ -f "/usr/local/include/X11/Xlib.h" ]
 }
 
-# Create web-only source
+# Use sed to replace all X11-specific code in one pass
 create_web_source() {
     local src="$1"
     local dst="$2"
     
     log_message "Creating web-only source..."
     
-    {
-        while IFS= read -r line || [ -n "$line" ]; do
-            case "$line" in
-                "#include <X11/Xlib.h>")
-                    echo "// X11 stubs for web-only build"
-                    echo "typedef unsigned long Window;"
-                    echo "typedef unsigned long GC;"
-                    echo "typedef unsigned long KeySym;"
-                    echo "typedef struct _XDisplay Display;"
-                    echo "typedef struct _XImage XImage;"
-                    echo "typedef union _XEvent XEvent;"
-                    echo "struct _XImage { int width, height; char *data; };"
-                    echo ""
-                    echo "static Display* XOpenDisplay(void* a) { return 0; }"
-                    echo "static int XCloseDisplay(void* a) { return 0; }"
-                    echo "static int DefaultScreen(void* a) { return 0; }"
-                    echo "static Window XCreateSimpleWindow(void* a, Window b, int c, int d, unsigned int e, unsigned int f, unsigned int g, unsigned long h, unsigned long i) { return 0; }"
-                    echo "static int XSelectInput(void* a, Window b, long c) { return 0; }"
-                    echo "static int XStoreName(void* a, Window b, char* c) { return 0; }"
-                    echo "static int XMapWindow(void* a, Window b) { return 0; }"
-                    echo "static GC XCreateGC(void* a, Window b, unsigned long c, void* d) { return 0; }"
-                    echo "static int XFreeGC(void* a, GC b) { return 0; }"
-                    echo "static int XDestroyWindow(void* a, Window b) { return 0; }"
-                    echo "static int XPending(void* a) { return 0; }"
-                    echo "static int XNextEvent(void* a, void* b) { return 0; }"
-                    echo "static KeySym XLookupKeysym(void* a, int b) { return 0; }"
-                    echo "static XImage* XCreateImage(void* a, void* b, int c, int d, int e, char* f, int g, int h, int i, int j) { return 0; }"
-                    echo "static int XPutImage(void* a, Window b, GC c, XImage* d, int e, int f, int g, int h, unsigned int i, unsigned int j) { return 0; }"
-                    echo "static int XFlush(void* a) { return 0; }"
-                    echo "static Window XRootWindow(void* a, int b) { return 0; }"
-                    echo "static unsigned long XBlackPixel(void* a, int b) { return 0; }"
-                    echo ""
-                    echo "#define KeyPress 2"
-                    echo "#define KeyRelease 3"
-                    echo "#define ButtonPress 4"
-                    echo "#define ButtonRelease 5"
-                    echo "#define MotionNotify 6"
-                    echo "#define MapNotify 19"
-                    echo "#define Expose 12"
-                    echo "#define ExposureMask 0"
-                    echo "#define KeyPressMask 0"
-                    echo "#define KeyReleaseMask 0"
-                    echo "#define ButtonPressMask 0"
-                    echo "#define ButtonReleaseMask 0"
-                    echo "#define PointerMotionMask 0"
-                    echo "#define StructureNotifyMask 0"
-                    echo ""
-                    ;;
-                "#include <X11/keysym.h>"|"#include <X11/Xutil.h>")
-                    # Skip
-                    ;;
-                *)
-                    echo "$line"
-                    ;;
-            esac
-        done < "$src"
-        
-        # Add stubs for X11 functions at the end
-        echo ""
-        echo "// Web-only implementations"
-        echo "static void x11_mirror_frame(void* gm) {}"
-        echo "static int x11_init(void* gm) { return 0; }"
-        echo "static int x11_to_keycode(void* ks) { return 0; }"
-        echo "static void x11_process(void* gm, int* running) {}"
-        echo "static void x11_cleanup(void* gm) {}"
-        
-    } > "$dst"
+    # Create header with all stubs
+    cat > "$dst" << 'HEADER'
+// SPANE Engine - Web-only build
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <dlfcn.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/select.h>
+
+// X11 type stubs
+typedef unsigned long Window;
+typedef unsigned long GC;
+typedef unsigned long KeySym;
+typedef unsigned long Visual;
+typedef struct _XDisplay Display;
+typedef struct _XImage XImage;
+typedef struct { int type; int x, y; int xbutton_button; int xmotion_x, xmotion_y; int xkey_keycode; } XEvent;
+struct _XImage { int width, height; char *data; };
+
+// X11 macros
+#define ZPixmap 2
+#define KeyPress 2
+#define KeyRelease 3
+#define ButtonPress 4
+#define ButtonRelease 5
+#define MotionNotify 6
+#define MapNotify 19
+#define Expose 12
+#define ExposureMask 0
+#define KeyPressMask 0
+#define ButtonPressMask 0
+#define PointerMotionMask 0
+#define StructureNotifyMask 0
+
+#define XK_Escape 0xFF1B
+#define XK_F1 0xFFBE
+#define XK_F2 0xFFBF
+#define XK_F3 0xFFC0
+#define XK_F4 0xFFC1
+#define XK_Up 0xFF52
+#define XK_Down 0xFF54
+#define XK_Left 0xFF51
+#define XK_Right 0xFF53
+#define XK_Return 0xFF0D
+#define XK_space 0x0020
+#define XK_w 0x0077
+#define XK_W 0x0057
+#define XK_s 0x0073
+#define XK_S 0x0053
+#define XK_a 0x0061
+#define XK_A 0x0041
+#define XK_d 0x0064
+#define XK_D 0x0044
+#define XK_r 0x0072
+#define XK_R 0x0052
+
+// X11 function stubs
+static Display* XOpenDisplay(void* a) { return 0; }
+static int XCloseDisplay(void* a) { return 0; }
+static int DefaultScreen(void* a) { return 0; }
+static Window XRootWindow(void* a, int b) { return 0; }
+static unsigned long XBlackPixel(void* a, int b) { return 0; }
+static Window XCreateSimpleWindow(void* a, Window b, int c, int d, unsigned int e, unsigned int f, unsigned int g, unsigned long h, unsigned long i) { return 0; }
+static int XSelectInput(void* a, Window b, long c) { return 0; }
+static int XStoreName(void* a, Window b, char* c) { return 0; }
+static int XMapWindow(void* a, Window b) { return 0; }
+static GC XCreateGC(void* a, Window b, unsigned long c, void* d) { return 0; }
+static int XFreeGC(void* a, GC b) { return 0; }
+static int XDestroyWindow(void* a, Window b) { return 0; }
+static int XPending(void* a) { return 0; }
+static int XNextEvent(void* a, void* b) { return 0; }
+static KeySym XLookupKeysym(void* a, int b) { return 0; }
+static Visual* XDefaultVisual(void* a, int b) { return 0; }
+static XImage* XCreateImage(void* a, void* b, int c, int d, int e, char* f, int g, int h, int i, int j) { return 0; }
+static int XPutImage(void* a, Window b, GC c, XImage* d, int e, int f, int g, int h, unsigned int i, unsigned int j) { return 0; }
+static int XFlush(void* a) { return 0; }
+static int XDestroyImage(void* a) { return 0; }
+
+// X11 function stubs
+static void x11_mirror_frame(void* gm) {}
+static int x11_init(void* gm) { return 0; }
+static int x11_to_keycode(void* ks) { return 0; }
+static void x11_process(void* gm, int* running) {}
+static void x11_cleanup(void* gm) {}
+
+HEADER
+
+    # Now copy the original file, skipping X11 includes and X11 function bodies
+    # Use sed to delete lines between markers
+    sed \
+        -e '/^#include <X11\//d' \
+        -e '/^\/\/ Compile:.*-lX11/d' \
+        -e '/^\/\/ Run:.*\[--web\]/d' \
+        -e '/^\/\/ Games are loaded/d' \
+        -e '/^\/\/ Place compiled/d' \
+        -e '/^static void x11_mirror_frame/,/^}$/d' \
+        -e '/^static int x11_init/,/^}$/d' \
+        -e '/^static int x11_to_keycode/,/^}$/d' \
+        -e '/^static void x11_process/,/^}$/d' \
+        -e '/^static void x11_cleanup/,/^}$/d' \
+        -e 's/DefaultVisual/XDefaultVisual/g' \
+        -e 's/RootWindow(/XRootWindow(/g' \
+        -e 's/BlackPixel(/XBlackPixel(/g' \
+        "$src" >> "$dst"
     
     [ -f "$dst" ] && [ -s "$dst" ]
 }
 
-# Compile engine
 compile_engine() {
     local src="$1"
     
     if has_x11; then
-        log_message "Building with X11 support"
+        log_message "Building with X11"
         
         local cflags=""
         local ldflags="-lX11"
@@ -284,7 +280,7 @@ compile_engine() {
         
         log_message "✓ Built with X11"
     else
-        log_message "Building web-only version"
+        log_message "Building web-only"
         
         local web_src="$BUILD_DIR/Spane_web.c"
         if ! create_web_source "$src" "$web_src"; then
@@ -308,43 +304,32 @@ compile_engine() {
     return 0
 }
 
-# Compile game libraries
 compile_games() {
-    log_message "Compiling game libraries..."
+    log_message "Compiling games..."
     
-    local games_dir="$MAIN_SOURCE_DIR/games"
-    mkdir -p "$BUILD_DIR/games"
-    
-    if [ ! -d "$games_dir" ]; then
-        mkdir -p "$games_dir"
-        log_message "Created games directory"
-    fi
+    local dir="$MAIN_SOURCE_DIR/games"
+    mkdir -p "$BUILD_DIR/games" "$dir"
     
     local count=0
-    for f in "$games_dir"/*.c; do
+    for f in "$dir"/*.c; do
         [ ! -f "$f" ] && continue
         local name=$(basename "$f" .c)
-        log_message "  Building $name..."
-        
-        if gcc -shared -fPIC -O3 -march=native \
-            -o "$BUILD_DIR/games/${name}.so" "$f" 2>&1; then
+        if gcc -shared -fPIC -O3 -march=native -o "$BUILD_DIR/games/${name}.so" "$f" 2>&1; then
             log_message "  ✓ $name.so"
             count=$((count + 1))
         else
-            log_message "  ✗ Failed: $name"
+            log_message "  ✗ $name"
         fi
     done
     
-    log_message "Games compiled: $count"
+    log_message "Games: $count"
     return 0
 }
 
-# Install
 install_spane() {
     log_message "Installing..."
     
     $SUDO mkdir -p "$INSTALL_DIR" "$GAMES_DIR" "$BIN_DIR"
-    
     $SUDO cp "$BUILD_DIR/$BINARY_NAME" "$INSTALL_DIR/"
     $SUDO chmod 755 "$INSTALL_DIR/$BINARY_NAME"
     
@@ -360,42 +345,29 @@ exec /usr/local/etc/Spane/spane "$@"
 EOF
     $SUDO chmod 755 "$INSTALL_DIR/run_spane.sh"
     
-    if [ -L "$BIN_DIR/$BINARY_NAME" ]; then
-        $SUDO rm -f "$BIN_DIR/$BINARY_NAME"
-    fi
+    [ -L "$BIN_DIR/$BINARY_NAME" ] && $SUDO rm -f "$BIN_DIR/$BINARY_NAME"
     $SUDO ln -sf "$INSTALL_DIR/run_spane.sh" "$BIN_DIR/$BINARY_NAME"
     
     log_message "✓ Installed"
 }
 
-# Cleanup
 cleanup() { rm -rf "$BUILD_DIR" 2>/dev/null; }
 
-# Uninstall
 uninstall_spane() {
     log_message "Uninstalling..."
-    if [ -L "$BIN_DIR/$BINARY_NAME" ]; then
-        $SUDO rm -f "$BIN_DIR/$BINARY_NAME"
-    fi
-    if [ -d "$INSTALL_DIR" ]; then
-        $SUDO rm -rf "$INSTALL_DIR"
-    fi
+    [ -L "$BIN_DIR/$BINARY_NAME" ] && $SUDO rm -f "$BIN_DIR/$BINARY_NAME"
+    [ -d "$INSTALL_DIR" ] && $SUDO rm -rf "$INSTALL_DIR"
     log_message "✓ Uninstalled"
 }
 
-# Help
 show_help() {
     echo "SPANE Game Engine Installer"
     echo ""
     echo "Usage: $0 [OPTIONS]"
     echo "  --install    Install (default)"
-    echo "  --web        Web-only install (no X11)"
-    echo "  --uninstall  Remove installation"
+    echo "  --web        Web-only install"
+    echo "  --uninstall  Remove"
     echo "  --help       This help"
-    echo ""
-    echo "Usage after install:"
-    echo "  spane           X11 mode"
-    echo "  spane --web     Web server (http://localhost:3000)"
 }
 
 # =============================================================================
@@ -411,13 +383,10 @@ esac
 echo ""
 echo "╔════════════════════════════════╗"
 echo "║  SPANE Game Engine Installer   ║"
-if [ "$WEB_MODE" = true ]; then
-    echo "║  Mode: Web Server Only         ║"
-fi
+[ "$WEB_MODE" = true ] && echo "║  Mode: Web Server Only         ║"
 echo "╚════════════════════════════════╝"
 echo ""
 
-# Check existing install
 if [ -d "$INSTALL_DIR" ]; then
     log_message "Existing installation found"
     printf "[1]=Update [2]=Remove [3]=Exit: "
@@ -429,19 +398,15 @@ if [ -d "$INSTALL_DIR" ]; then
     esac
 fi
 
-# Install build tools (required)
 install_build_tools
 
-# Install X11 if needed
 if [ "$WEB_MODE" = false ]; then
     install_x11_libs
 fi
 
-# Setup build dir
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
-# Find source
 src="$MAIN_SOURCE_DIR/$MAIN_FILE"
 if [ ! -f "$src" ]; then
     src=$(find "$MAIN_SOURCE_DIR" -maxdepth 1 -name "*.c" -exec grep -l "int main" {} \; | head -1)
@@ -454,7 +419,6 @@ fi
 
 log_message "Source: $src"
 
-# Compile
 if compile_engine "$src"; then
     compile_games
     install_spane
@@ -466,13 +430,9 @@ if compile_engine "$src"; then
     echo "╔════════════════════════════════╗"
     echo "║    Installation Complete!      ║"
     echo "║                                ║"
-    if has_x11; then
-        echo "║  spane          X11 mode       ║"
-    fi
+    has_x11 && echo "║  spane          X11 mode       ║"
     echo "║  spane --web    Web mode       ║"
     echo "║  Games: $games                    ║"
-    echo "║                                ║"
-    echo "║  Add games: $GAMES_DIR"
     echo "╚════════════════════════════════╝"
     echo ""
 else
