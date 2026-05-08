@@ -25,7 +25,6 @@ BINARY_NAME="spane"
 BUILD_DIR="/tmp/spane_build_$$"
 
 WEB_MODE=false
-WSL_MODE=false
 
 if [ "$(id -u)" = "0" ]; then
     SUDO=""
@@ -34,15 +33,15 @@ else
 fi
 
 # =============================================================================
-# DETECTION FUNCTIONS
+# FUNCTIONS
 # =============================================================================
 
-detect_wsl() {
-    if grep -qi microsoft /proc/version 2>/dev/null || grep -qi wsl /proc/version 2>/dev/null; then
-        WSL_MODE=true
-        return 0
-    fi
-    return 1
+log_message() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
 }
 
 detect_package_manager() {
@@ -61,18 +60,6 @@ detect_package_manager() {
     else
         echo "unknown"
     fi
-}
-
-# =============================================================================
-# FUNCTIONS
-# =============================================================================
-
-log_message() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
-}
-
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
 }
 
 install_build_tools() {
@@ -165,14 +152,14 @@ install_x11_libs() {
 }
 
 install_zenity() {
-    log_message "WSL detected - checking zenity..."
+    log_message "Checking zenity..."
     
     if command_exists zenity; then
         log_message "✓ zenity already installed"
         return 0
     fi
     
-    log_message "Installing zenity for WSL..."
+    log_message "Installing zenity..."
     local pkg_manager=$(detect_package_manager)
     
     case "$pkg_manager" in
@@ -463,7 +450,7 @@ show_help() {
     echo ""
     echo "Usage: $0 [OPTIONS]"
     echo "  --install    Install (default)"
-    echo "  --web        Web-only install"
+    echo "  --web        Web-only install (skip X11)"
     echo "  --uninstall  Remove"
     echo "  --help       This help"
 }
@@ -485,12 +472,6 @@ echo "║  SPANE Game Engine Installer   ║"
 echo "╚════════════════════════════════╝"
 echo ""
 
-# Detect WSL
-detect_wsl
-if [ "$WSL_MODE" = true ]; then
-    log_message "WSL environment detected"
-fi
-
 if [ -d "$INSTALL_DIR" ]; then
     log_message "Existing installation found"
     printf "[1]=Update [2]=Remove [3]=Exit: "
@@ -503,14 +484,10 @@ if [ -d "$INSTALL_DIR" ]; then
 fi
 
 install_build_tools
+install_zenity
 
 if [ "$WEB_MODE" = false ]; then
     install_x11_libs
-fi
-
-# Install zenity if running in WSL
-if [ "$WSL_MODE" = true ]; then
-    install_zenity
 fi
 
 rm -rf "$BUILD_DIR"
@@ -539,14 +516,9 @@ if compile_engine "$src"; then
     echo "╔════════════════════════════════╗"
     echo "║    Installation Complete!      ║"
     echo "║                                ║"
-    if has_x11; then
-        echo "║  spane          X11 mode       ║"
-    fi
+    has_x11 && echo "║  spane          X11 mode       ║"
     echo "║  spane --web    Web mode       ║"
     echo "║  Games: $games                    ║"
-    if [ "$WSL_MODE" = true ]; then
-        echo "║  WSL: zenity enabled           ║"
-    fi
     echo "╚════════════════════════════════╝"
     echo ""
 else
