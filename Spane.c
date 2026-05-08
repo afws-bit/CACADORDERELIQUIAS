@@ -1,3 +1,13 @@
+// =============================================================================
+// SPANE GAME ENGINE - Complete Single File
+// =============================================================================
+// Compile: gcc -O3 -o spane Spane.c -lX11 -lm -ldl -lpthread
+// Run: ./spane [--web]
+// 
+// Games are loaded from ./games/*.so at startup
+// Place compiled game .so files in the games/ directory
+// =============================================================================
+
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
 #include <X11/Xutil.h>
@@ -10,6 +20,13 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <dlfcn.h>
+#include <dirent.h>
+#include <sys/stat.h>
+
+// =============================================================================
+// CONFIGURATION
+// =============================================================================
 
 #define MAIN_WINDOW_WIDTH  1000
 #define MAIN_WINDOW_HEIGHT 700
@@ -18,15 +35,15 @@
 #define GAME_AREA_X        180
 #define GAME_AREA_Y        50
 #define SIDEBAR_WIDTH      160
-
-#define TILE_SIZE     32
-#define MAP_WIDTH     25
-#define MAP_HEIGHT    18
-#define PLAYER_SPEED  5
+#define MAX_GAMES          20
+#define MAX_PATH           512
 
 #define WEB_PORT 3000
 
-// 5x7 bitmap font (ASCII 32-126)
+// =============================================================================
+// 5x7 BITMAP FONT (ASCII 32-126)
+// =============================================================================
+
 static const unsigned char font_5x7[][5] = {
     {0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x5f,0x00,0x00},{0x00,0x07,0x00,0x07,0x00},
     {0x14,0x7f,0x14,0x7f,0x14},{0x24,0x2a,0x7f,0x2a,0x12},{0x23,0x13,0x08,0x64,0x62},
@@ -62,18 +79,27 @@ static const unsigned char font_5x7[][5] = {
     {0x00,0x41,0x36,0x08,0x00},{0x08,0x08,0x2a,0x1c,0x08}
 };
 
+// =============================================================================
+// SDK TYPES - Game developers use these
+// =============================================================================
+
+typedef struct Framebuffer Framebuffer;
 typedef struct Game Game;
 typedef struct GameManager GameManager;
 
-// THE framebuffer - single source of truth for all rendering
-typedef struct {
+struct Framebuffer {
     unsigned char pixels[MAIN_WINDOW_WIDTH * MAIN_WINDOW_HEIGHT * 4];
-} Framebuffer;
+};
 
+// Game interface - define your game by implementing these functions
 struct Game {
-    char name[32];
+    char name[64];
+    char path[MAX_PATH];
     void* data;
+    void* handle;        // dlopen handle
     int active;
+    
+    // SDK function pointers - implement these in your game
     void (*init)(Game* game);
     void (*handle_key)(Game* game, int key_code, int pressed);
     void (*handle_click)(Game* game, int x, int y);
@@ -83,9 +109,8 @@ struct Game {
 };
 
 struct GameManager {
-    // Engine state (runs headless)
     Framebuffer framebuffer;
-    Game* games[5];
+    Game* games[MAX_GAMES];
     int game_count;
     int current_game;
     int hover_button;
@@ -95,20 +120,17 @@ struct GameManager {
     double fps;
     pthread_mutex_t fb_mutex;
     
-    // X11 mirror (just displays framebuffer)
     Display* display;
     Window window;
     GC gc;
     XImage* ximage;
     int x11_running;
-    
-    // Web mirror
     int web_mode;
 };
 
-// ============================================
-// FRAMEBUFFER PRIMITIVES (Headless rendering)
-// ============================================
+// =============================================================================
+// SDK DRAWING FUNCTIONS
+// =============================================================================
 
 static inline void fb_pixel(Framebuffer* fb, int x, int y, unsigned char r, unsigned char g, unsigned char b) {
     if (x < 0 || x >= MAIN_WINDOW_WIDTH || y < 0 || y >= MAIN_WINDOW_HEIGHT) return;
@@ -127,10 +149,10 @@ static void fb_rect(Framebuffer* fb, int x, int y, int w, int h, unsigned char r
     for (int dy=1; dy<h-1; dy++) { fb_pixel(fb,x,y+dy,r,g,b); fb_pixel(fb,x+w-1,y+dy,r,g,b); }
 }
 
-static void fb_circle(Framebuffer* fb, int cx, int cy, int r, unsigned char R, unsigned char G, unsigned char B) {
-    for (int dy=-r; dy<=r; dy++)
-        for (int dx=-r; dx<=r; dx++)
-            if (dx*dx+dy*dy <= r*r) fb_pixel(fb, cx+dx, cy+dy, R, G, B);
+static void fb_circle(Framebuffer* fb, int cx, int cy, int radius, unsigned char R, unsigned char G, unsigned char B) {
+    for (int dy=-radius; dy<=radius; dy++)
+        for (int dx=-radius; dx<=radius; dx++)
+            if (dx*dx+dy*dy <= radius*radius) fb_pixel(fb, cx+dx, cy+dy, R, G, B);
 }
 
 static void fb_char(Framebuffer* fb, int x, int y, char c, unsigned char r, unsigned char g, unsigned char b) {
@@ -149,326 +171,318 @@ static void fb_text_center(Framebuffer* fb, int x, int y, int w, const char* s, 
     fb_text(fb, x+(w-(int)strlen(s)*6)/2, y, s, r, g, b);
 }
 
-// ============================================
-// RPG GAME (Headless rendering)
-// ============================================
+// =============================================================================
+// GAME LOADER - Dynamically loads .so files
+// =============================================================================
 
-typedef struct {
-    int map[18][25];
-    int px, py, dir, frame, moving;
-    int ku,kd,kl,kr;
-} RPGData;
+typedef Game* (*create_game_fn)();
 
-static int rpg_map[18][25] = {
-    {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1},
-    {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
-    {1,0,0,0,0,0,0,0,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0,1},
-    {1,0,0,3,3,3,0,0,0,0,0,0,4,0,0,5,0,0,0,0,0,0,0,0,1},
-    {1,0,0,3,3,3,0,0,0,0,0,0,0,0,0,5,0,0,0,0,0,0,0,0,1},
-    {1,0,0,0,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0,2,2,2,0,1},
-    {1,0,0,0,0,0,0,0,4,0,0,0,0,0,0,0,0,3,3,3,2,2,2,0,1},
-    {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,3,3,0,0,0,0,1},
-    {1,0,0,0,0,0,0,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0,0,1},
-    {1,0,0,5,0,0,0,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0,0,1},
-    {1,0,0,5,0,0,0,0,0,0,0,0,0,0,0,0,5,0,0,0,0,0,0,0,1},
-    {1,0,0,0,0,0,0,3,3,3,0,0,0,0,0,0,5,0,0,0,0,0,0,0,1},
-    {1,0,0,0,0,0,0,3,3,3,0,0,0,0,0,0,0,0,0,0,4,0,0,0,1},
-    {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,4,0,0,0,1},
-    {1,0,0,0,0,0,0,0,0,0,0,0,5,0,0,0,0,0,0,0,0,0,0,0,1},
-    {1,0,0,0,0,0,0,0,0,0,0,0,5,0,0,0,0,0,0,0,0,0,0,0,1},
-    {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
-    {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1}
-};
-
-static int rpg_walkable(RPGData* d, int x, int y) {
-    return (x>=0&&x<MAP_WIDTH&&y>=0&&y<MAP_HEIGHT&&(d->map[y][x]==0||d->map[y][x]==3));
-}
-
-static void rpg_tile(Framebuffer* fb, int x, int y, int t) {
-    unsigned char r,g,b;
-    switch(t) {
-        case 0: r=0x33;g=0xAA;b=0x33;break; case 1: r=0x66;g=0x66;b=0x66;break;
-        case 2: r=0x33;g=0x55;b=0xAA;break; case 3: r=0xCC;g=0xAA;b=0x66;break;
-        case 4: r=0x22;g=0x66;b=0x22;break; case 5: r=0x88;g=0x44;b=0x22;break;
-        default: r=g=b=0;
+static int load_game_from_so(GameManager* gm, const char* path) {
+    void* handle = dlopen(path, RTLD_NOW);
+    if (!handle) {
+        fprintf(stderr, "Failed to load %s: %s\n", path, dlerror());
+        return 0;
     }
-    fb_fill(fb,x,y,TILE_SIZE,TILE_SIZE,r,g,b);
-    if(t==4){fb_circle(fb,x+16,y,TILE_SIZE/2+2,0x00,0xCC,0x00);fb_fill(fb,x+13,y+16,6,16,0x66,0x44,0x22);}
-    if(t==5){fb_fill(fb,x+4,y+8,24,24,0xCC,0x33,0x33);for(int i=0;i<12;i++)fb_fill(fb,x+12-i,y+8-i,i*2+4,1,0x88,0x44,0x22);}
-}
-
-static void rpg_player(Framebuffer* fb, int x, int y, int dir, int frame) {
-    fb_fill(fb,x+8,y+12,16,14,0x33,0x66,0xFF);
-    fb_circle(fb,x+16,y+10,8,0xFF,0xCC,0x99);
-    if(dir==1) fb_fill(fb,x+9,y+8,3,3,0,0,0);
-    else if(dir==2) fb_fill(fb,x+20,y+8,3,3,0,0,0);
-    else {fb_fill(fb,x+12,y+8,3,3,0,0,0);fb_fill(fb,x+19,y+8,3,3,0,0,0);}
-    if(frame%20<10){fb_fill(fb,x+9,y+26,5,8,0,0,0x88);fb_fill(fb,x+18,y+26,5,8,0,0,0x88);}
-    else{fb_fill(fb,x+10,y+26,5,8,0,0,0x88);fb_fill(fb,x+17,y+26,5,8,0,0,0x88);}
-}
-
-static void rpg_init(Game* g) {
-    RPGData* d=calloc(1,sizeof(RPGData));
-    memcpy(d->map,rpg_map,sizeof(rpg_map));
-    d->px=5*TILE_SIZE; d->py=5*TILE_SIZE;
-    g->data=d; printf("RPG ready\n");
-}
-static void rpg_key(Game* g, int k, int p) {
-    RPGData* d=g->data;
-    switch(k){
-        case 38:case 87: d->ku=p; if(p)d->dir=3; break;
-        case 40:case 83: d->kd=p; if(p)d->dir=0; break;
-        case 37:case 65: d->kl=p; if(p)d->dir=1; break;
-        case 39:case 68: d->kr=p; if(p)d->dir=2; break;
+    
+    create_game_fn create = (create_game_fn)dlsym(handle, "create_game");
+    if (!create) {
+        fprintf(stderr, "No create_game symbol in %s\n", path);
+        dlclose(handle);
+        return 0;
     }
-}
-static void rpg_click(Game* g, int x, int y) {
-    RPGData* d=g->data;
-    if(x>=GAME_AREA_X&&x<GAME_AREA_X+GAME_AREA_WIDTH&&y>=GAME_AREA_Y&&y<GAME_AREA_Y+GAME_AREA_HEIGHT){
-        int nx=x-GAME_AREA_X-16, ny=y-GAME_AREA_Y-16;
-        if(rpg_walkable(d,nx/TILE_SIZE,ny/TILE_SIZE)&&rpg_walkable(d,(nx+31)/TILE_SIZE,(ny+31)/TILE_SIZE))
-            {d->px=nx;d->py=ny;}
+    
+    Game* game = create();
+    if (!game) {
+        fprintf(stderr, "create_game returned NULL for %s\n", path);
+        dlclose(handle);
+        return 0;
     }
-}
-static void rpg_update(Game* g) {
-    RPGData* d=g->data; d->moving=0;
-    int nx=d->px, ny=d->py;
-    if(d->ku){ny-=PLAYER_SPEED;d->moving=1;}
-    if(d->kd){ny+=PLAYER_SPEED;d->moving=1;}
-    if(d->kl){nx-=PLAYER_SPEED;d->moving=1;}
-    if(d->kr){nx+=PLAYER_SPEED;d->moving=1;}
-    if(d->moving&&rpg_walkable(d,nx/TILE_SIZE,ny/TILE_SIZE)&&rpg_walkable(d,(nx+31)/TILE_SIZE,ny/TILE_SIZE)
-       &&rpg_walkable(d,nx/TILE_SIZE,(ny+31)/TILE_SIZE)&&rpg_walkable(d,(nx+31)/TILE_SIZE,(ny+31)/TILE_SIZE))
-        {d->px=nx;d->py=ny;}
-    if(d->px<0)d->px=0; if(d->py<0)d->py=0;
-    if(d->px>(MAP_WIDTH-1)*TILE_SIZE)d->px=(MAP_WIDTH-1)*TILE_SIZE;
-    if(d->py>(MAP_HEIGHT-1)*TILE_SIZE)d->py=(MAP_HEIGHT-1)*TILE_SIZE;
-    if(d->moving)d->frame++; else d->frame=0;
-}
-static void rpg_render(Game* g, Framebuffer* fb) {
-    RPGData* d=g->data;
-    fb_fill(fb,GAME_AREA_X,GAME_AREA_Y,GAME_AREA_WIDTH,GAME_AREA_HEIGHT,0,0,0);
-    for(int y=0;y<MAP_HEIGHT;y++)
-        for(int x=0;x<MAP_WIDTH;x++)
-            rpg_tile(fb,GAME_AREA_X+x*TILE_SIZE,GAME_AREA_Y+y*TILE_SIZE,d->map[y][x]);
-    rpg_player(fb,GAME_AREA_X+d->px,GAME_AREA_Y+d->py,d->dir,d->frame);
-    char s[200]; snprintf(s,sizeof(s),"RPG Adventure - Pos:(%d,%d) - ArrowKeys/WASD",d->px/TILE_SIZE,d->py/TILE_SIZE);
-    fb_text(fb,GAME_AREA_X+10,GAME_AREA_Y+GAME_AREA_HEIGHT-10,s,0xFF,0xFF,0xFF);
-}
-static void rpg_cleanup(Game* g) { free(g->data); }
-
-// ============================================
-// SNAKE GAME (Headless rendering)
-// ============================================
-
-#define SG 20
-#define SML 500
-#define SAW 800
-#define SAH 600
-#define SNC (SAW/SG)
-#define SNR (SAH/SG)
-
-typedef struct {int x,y;} Pt;
-typedef struct {
-    Pt s[SML]; int len,dir,ndir,score,go,fc,spd; Pt food;
-} SnakeData;
-
-static void sn_food(SnakeData* d) {
-    int v; do{v=1;d->food.x=rand()%SNC;d->food.y=rand()%SNR;
-        for(int i=0;i<d->len;i++) if(d->s[i].x==d->food.x&&d->s[i].y==d->food.y){v=0;break;}
-    }while(!v);
-}
-static void sn_init(Game* g) {
-    SnakeData* d=calloc(1,sizeof(SnakeData)); d->len=3; int sx=SNC/2,sy=SNR/2;
-    for(int i=0;i<d->len;i++){d->s[i].x=sx-i;d->s[i].y=sy;}
-    d->spd=10; sn_food(d); g->data=d; printf("Snake ready\n");
-}
-static void sn_key(Game* g, int k, int p) {
-    SnakeData* d=g->data; if(!p)return;
-    if(d->go){if(k==82){d->len=3;int sx=SNC/2,sy=SNR/2;for(int i=0;i<d->len;i++){d->s[i].x=sx-i;d->s[i].y=sy;}
-        d->dir=0;d->ndir=0;d->score=0;d->go=0;d->fc=0;sn_food(d);}return;}
-    switch(k){case 38:case 87:if(d->dir!=1)d->ndir=3;break;case 40:case 83:if(d->dir!=3)d->ndir=1;break;
-        case 37:case 65:if(d->dir!=0)d->ndir=2;break;case 39:case 68:if(d->dir!=2)d->ndir=0;break;}
-}
-static void sn_click(Game* g, int x, int y) { (void)g;(void)x;(void)y; }
-static void sn_update(Game* g) {
-    SnakeData* d=g->data; if(d->go)return;
-    if(++d->fc<d->spd)return; d->fc=0; d->dir=d->ndir;
-    Pt nh=d->s[0]; switch(d->dir){case 0:nh.x++;break;case 1:nh.y++;break;case 2:nh.x--;break;case 3:nh.y--;break;}
-    if(nh.x<0||nh.x>=SNC||nh.y<0||nh.y>=SNR){d->go=1;return;}
-    for(int i=0;i<d->len;i++) if(d->s[i].x==nh.x&&d->s[i].y==nh.y){d->go=1;return;}
-    int ate=(nh.x==d->food.x&&nh.y==d->food.y);
-    for(int i=d->len-1;i>0;i--) d->s[i]=d->s[i-1]; d->s[0]=nh;
-    if(ate){d->len++;d->score+=10;if(d->spd>3)d->spd--;sn_food(d);}
-}
-static void sn_render(Game* g, Framebuffer* fb) {
-    SnakeData* d=g->data;
-    fb_fill(fb,GAME_AREA_X,GAME_AREA_Y,SAW,SAH,0x1A,0x1A,0x2E);
-    for(int i=0;i<=SNC;i++)fb_fill(fb,GAME_AREA_X+i*SG,GAME_AREA_Y,1,SAH,0x25,0x25,0x40);
-    for(int i=0;i<=SNR;i++)fb_fill(fb,GAME_AREA_X,GAME_AREA_Y+i*SG,SAW,1,0x25,0x25,0x40);
-    int fx=GAME_AREA_X+d->food.x*SG,fy=GAME_AREA_Y+d->food.y*SG;
-    fb_circle(fb,fx+SG/2,fy+SG/2,SG/2-2,0xFF,0x33,0x33);
-    for(int i=0;i<d->len;i++){
-        int sx=GAME_AREA_X+d->s[i].x*SG+1,sy=GAME_AREA_Y+d->s[i].y*SG+1;
-        fb_fill(fb,sx,sy,SG-2,SG-2,i==0?0x00:0x00,i==0?0xFF:0xAA,0x00);
+    
+    game->handle = handle;
+    strncpy(game->path, path, MAX_PATH-1);
+    
+    if (gm->game_count < MAX_GAMES) {
+        gm->games[gm->game_count++] = game;
+        printf("Loaded game: %s from %s\n", game->name, path);
+        return 1;
     }
-    char t[50]; snprintf(t,sizeof(t),"Score: %d",d->score);
-    fb_text(fb,GAME_AREA_X+10,GAME_AREA_Y+20,t,0xFF,0xFF,0xFF);
-    if(d->go){fb_fill(fb,GAME_AREA_X+250,GAME_AREA_Y+250,300,100,0,0,0);
-        fb_text(fb,GAME_AREA_X+340,GAME_AREA_Y+280,"GAME OVER!",0xFF,0,0);
-        fb_text(fb,GAME_AREA_X+320,GAME_AREA_Y+310,"Press R to restart",0xFF,0xFF,0xFF);}
-    snprintf(t,sizeof(t),"Snake - Arrows/WASD - Length:%d",d->len);
-    fb_text(fb,GAME_AREA_X+10,GAME_AREA_Y+SAH-10,t,0x88,0x88,0x88);
+    
+    dlclose(handle);
+    return 0;
 }
-static void sn_cleanup(Game* g) { free(g->data); }
 
-// ============================================
-// ENGINE (Headless game manager)
-// ============================================
-
-static void gm_add(GameManager* gm, Game* g) {
-    if(gm->game_count<5) gm->games[gm->game_count++]=g;
-}
-static void gm_switch(GameManager* gm, int i) {
-    if(i>=0&&i<gm->game_count&&i!=gm->current_game){gm->current_game=i;printf("Switch: %s\n",gm->games[i]->name);}
-}
-static void gm_click(GameManager* gm, int x, int y) {
-    if(x<SIDEBAR_WIDTH){
-        int by=70;
-        for(int i=0;i<gm->game_count;i++){
-            if(y>=by&&y<by+40&&x>=15&&x<SIDEBAR_WIDTH-15){gm_switch(gm,i);return;}
-            by+=55;
+static void scan_games_directory(GameManager* gm, const char* dir_path) {
+    DIR* dir = opendir(dir_path);
+    if (!dir) {
+        printf("No games directory found at: %s\n", dir_path);
+        return;
+    }
+    
+    struct dirent* entry;
+    char full_path[MAX_PATH];
+    
+    while ((entry = readdir(dir)) != NULL) {
+        // Skip . and ..
+        if (entry->d_name[0] == '.') continue;
+        
+        // Check if it's a .so file
+        int len = strlen(entry->d_name);
+        if (len < 3 || strcmp(entry->d_name + len - 3, ".so") != 0) continue;
+        
+        snprintf(full_path, MAX_PATH, "%s/%s", dir_path, entry->d_name);
+        
+        // Check if it's a regular file
+        struct stat st;
+        if (stat(full_path, &st) == 0 && S_ISREG(st.st_mode)) {
+            load_game_from_so(gm, full_path);
         }
-    } else if(gm->games[gm->current_game]->active)
-        gm->games[gm->current_game]->handle_click(gm->games[gm->current_game],x,y);
+    }
+    
+    closedir(dir);
+    
+    if (gm->game_count == 0) {
+        printf("No valid game .so files found in %s\n", dir_path);
+    }
 }
+
+// =============================================================================
+// ENGINE RENDERING
+// =============================================================================
+
 static void gm_render(GameManager* gm) {
     pthread_mutex_lock(&gm->fb_mutex);
-    Framebuffer* fb=&gm->framebuffer;
+    Framebuffer* fb = &gm->framebuffer;
     
-    // Clear
-    fb_fill(fb,0,0,MAIN_WINDOW_WIDTH,MAIN_WINDOW_HEIGHT,0x1A,0x1A,0x1A);
+    // Clear background
+    fb_fill(fb, 0, 0, MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT, 0x1A, 0x1A, 0x1A);
     
     // Sidebar
-    fb_fill(fb,0,0,SIDEBAR_WIDTH,MAIN_WINDOW_HEIGHT,0x1A,0x1A,0x1A);
-    fb_text_center(fb,0,25,SIDEBAR_WIDTH,"GAME HUB",0xFF,0xFF,0xFF);
-    fb_fill(fb,10,45,SIDEBAR_WIDTH-20,2,0xCC,0xCC,0xCC);
-    int by=70;
-    for(int i=0;i<gm->game_count;i++){
-        int act=(i==gm->current_game), hov=(i==gm->hover_button);
-        unsigned char r,g,b;
-        if(act){r=0x33;g=0x55;b=0xAA;}else if(hov){r=0xCC;g=0xAA;b=0x33;}else{r=0x33;g=0x33;b=0x33;}
-        fb_fill(fb,15,by,SIDEBAR_WIDTH-30,40,r,g,b);
-        fb_rect(fb,15,by,SIDEBAR_WIDTH-30,40,0xCC,0xCC,0xCC);
-        fb_text_center(fb,15,by+16,SIDEBAR_WIDTH-30,gm->games[i]->name,0xFF,0xFF,0xFF);
-        by+=55;
+    fb_fill(fb, 0, 0, SIDEBAR_WIDTH, MAIN_WINDOW_HEIGHT, 0x15, 0x15, 0x18);
+    fb_text_center(fb, 0, 15, SIDEBAR_WIDTH, "SPANE ENGINE", 0x00, 0xCC, 0xFF);
+    fb_fill(fb, 10, 35, SIDEBAR_WIDTH-20, 2, 0x00, 0x88, 0xCC);
+    
+    int by = 55;
+    for (int i = 0; i < gm->game_count; i++) {
+        int act = (i == gm->current_game);
+        int hov = (i == gm->hover_button);
+        unsigned char r, g, b;
+        
+        if (act) { r = 0x00; g = 0x88; b = 0xCC; }
+        else if (hov) { r = 0xCC; g = 0x88; b = 0x00; }
+        else { r = 0x25; g = 0x25; b = 0x2A; }
+        
+        fb_fill(fb, 10, by, SIDEBAR_WIDTH-20, 35, r, g, b);
+        fb_rect(fb, 10, by, SIDEBAR_WIDTH-20, 35, act ? 0x00:0x44, act ? 0xCC:0x44, act ? 0xFF:0x44);
+        fb_text_center(fb, 10, by+12, SIDEBAR_WIDTH-20, gm->games[i]->name, 0xFF, 0xFF, 0xFF);
+        by += 45;
     }
-    int bot=MAIN_WINDOW_HEIGHT-120;
-    fb_fill(fb,10,bot,SIDEBAR_WIDTH-20,2,0xCC,0xCC,0xCC);
-    char fs[32]; snprintf(fs,sizeof(fs),"FPS: %.1f",gm->fps);
-    fb_text(fb,15,bot+15,fs,0xFF,0xFF,0xFF);
-    fb_text(fb,15,bot+35,"ESC to quit",0xFF,0xFF,0xFF);
     
-    // Border
-    for(int t=0;t<3;t++)
-        fb_rect(fb,GAME_AREA_X-t-1,GAME_AREA_Y-t-1,GAME_AREA_WIDTH+2*t+2,GAME_AREA_HEIGHT+2*t+2,0xCC,0xCC,0xCC);
-    char lb[64]; snprintf(lb,sizeof(lb),"Current Game: %s",gm->games[gm->current_game]->name);
-    fb_text(fb,GAME_AREA_X,GAME_AREA_Y-15,lb,0xFF,0xFF,0xFF);
+    // Load button
+    int lby = MAIN_WINDOW_HEIGHT - 140;
+    fb_fill(fb, 10, lby, SIDEBAR_WIDTH-20, 30, 0x00, 0x66, 0x00);
+    fb_rect(fb, 10, lby, SIDEBAR_WIDTH-20, 30, 0x00, 0x88, 0x00);
+    fb_text_center(fb, 10, lby+9, SIDEBAR_WIDTH-20, "[ Load Game ]", 0xFF, 0xFF, 0xFF);
     
-    // Game
-    if(gm->games[gm->current_game]->active)
-        gm->games[gm->current_game]->render(gm->games[gm->current_game],fb);
+    // FPS and info
+    char fs[64];
+    snprintf(fs, sizeof(fs), "FPS: %.1f", gm->fps);
+    fb_text(fb, 10, lby+45, fs, 0x88, 0x88, 0x88);
+    
+    char game_count_str[32];
+    snprintf(game_count_str, sizeof(game_count_str), "Games: %d", gm->game_count);
+    fb_text(fb, 10, lby+60, game_count_str, 0x88, 0x88, 0x88);
+    
+    // Game area border
+    for (int t = 0; t < 2; t++)
+        fb_rect(fb, GAME_AREA_X-t-1, GAME_AREA_Y-t-1, GAME_AREA_WIDTH+2*t+2, GAME_AREA_HEIGHT+2*t+2, 0x44, 0x44, 0x55);
+    
+    // Game title
+    if (gm->game_count > 0 && gm->current_game < gm->game_count) {
+        char lb[128];
+        snprintf(lb, sizeof(lb), "Game: %s", gm->games[gm->current_game]->name);
+        fb_text(fb, GAME_AREA_X, GAME_AREA_Y-15, lb, 0xCC, 0xCC, 0xCC);
+        
+        // Render current game
+        if (gm->games[gm->current_game]->active)
+            gm->games[gm->current_game]->render(gm->games[gm->current_game], fb);
+    } else {
+        // No games loaded message
+        fb_text_center(fb, GAME_AREA_X, GAME_AREA_Y + GAME_AREA_HEIGHT/2 - 10, GAME_AREA_WIDTH,
+                       "No games loaded. Place .so files in ./games/", 0x88, 0x88, 0x88);
+        fb_text_center(fb, GAME_AREA_X, GAME_AREA_Y + GAME_AREA_HEIGHT/2 + 10, GAME_AREA_WIDTH,
+                       "Click [Load Game] to select a game file", 0x66, 0x66, 0x66);
+    }
     
     pthread_mutex_unlock(&gm->fb_mutex);
 }
-static void gm_fps(GameManager* gm) {
-    gm->frame_count++; time_t n=time(NULL);
-    if(n-gm->last_fps_update>=1){gm->fps=gm->frame_count/(double)(n-gm->last_fps_update);gm->frame_count=0;gm->last_fps_update=n;}
+
+static void gm_switch(GameManager* gm, int i) {
+    if (i >= 0 && i < gm->game_count && i != gm->current_game) {
+        gm->current_game = i;
+        printf("Switched to: %s\n", gm->games[i]->name);
+    }
 }
 
-// ============================================
-// X11 MIRROR (Just displays the framebuffer)
-// ============================================
+static void gm_click(GameManager* gm, int x, int y) {
+    // Check load button
+    int lby = MAIN_WINDOW_HEIGHT - 140;
+    if (x >= 10 && x < SIDEBAR_WIDTH-10 && y >= lby && y < lby+30) {
+        // Open file browser dialog using zenity
+        printf("Load Game button clicked - opening file browser...\n");
+        int ret = system("zenity --file-selection --title=\"Select Game .so file\" "
+                         "--file-filter=\"Shared Objects (*.so) | *.so\" "
+                         "> /tmp/spane_load_game.txt 2>/dev/null");
+        if (ret == 0) {
+            FILE* f = fopen("/tmp/spane_load_game.txt", "r");
+            if (f) {
+                char path[MAX_PATH];
+                if (fgets(path, sizeof(path), f)) {
+                    // Remove newline
+                    path[strcspn(path, "\n")] = 0;
+                    if (strlen(path) > 0) {
+                        printf("Loading game from: %s\n", path);
+                        if (load_game_from_so(gm, path)) {
+                            // Initialize the newly loaded game
+                            Game* new_game = gm->games[gm->game_count - 1];
+                            if (new_game->init) {
+                                new_game->init(new_game);
+                            }
+                            gm->current_game = gm->game_count - 1;
+                            printf("Game loaded and activated!\n");
+                        } else {
+                            printf("Failed to load game from: %s\n", path);
+                        }
+                    }
+                }
+                fclose(f);
+            }
+            remove("/tmp/spane_load_game.txt");
+        }
+        return;
+    }
+    
+    // Check sidebar game buttons
+    if (x < SIDEBAR_WIDTH) {
+        int by = 55;
+        for (int i = 0; i < gm->game_count; i++) {
+            if (y >= by && y < by+35 && x >= 10 && x < SIDEBAR_WIDTH-10) {
+                gm_switch(gm, i);
+                return;
+            }
+            by += 45;
+        }
+    } else if (gm->game_count > 0 && gm->current_game < gm->game_count 
+               && gm->games[gm->current_game]->active) {
+        gm->games[gm->current_game]->handle_click(gm->games[gm->current_game], x, y);
+    }
+}
+
+static void gm_fps(GameManager* gm) {
+    gm->frame_count++;
+    time_t n = time(NULL);
+    if (n - gm->last_fps_update >= 1) {
+        gm->fps = gm->frame_count / (double)(n - gm->last_fps_update);
+        gm->frame_count = 0;
+        gm->last_fps_update = n;
+    }
+}
+
+// =============================================================================
+// X11 MIRROR
+// =============================================================================
 
 static void x11_mirror_frame(GameManager* gm) {
-    if(!gm->display||!gm->ximage) return;
+    if (!gm->display || !gm->ximage) return;
     pthread_mutex_lock(&gm->fb_mutex);
-    // Convert RGBA framebuffer to X11's BGRX format
     unsigned char* src = gm->framebuffer.pixels;
     char* dst = gm->ximage->data;
-    for(int i=0; i<MAIN_WINDOW_WIDTH*MAIN_WINDOW_HEIGHT; i++) {
-        dst[i*4+0] = src[i*4+2]; // B
-        dst[i*4+1] = src[i*4+1]; // G
-        dst[i*4+2] = src[i*4+0]; // R
-        dst[i*4+3] = 0;           // X (unused)
+    for (int i = 0; i < MAIN_WINDOW_WIDTH * MAIN_WINDOW_HEIGHT; i++) {
+        dst[i*4+0] = src[i*4+2];
+        dst[i*4+1] = src[i*4+1];
+        dst[i*4+2] = src[i*4+0];
+        dst[i*4+3] = 0;
     }
-    XPutImage(gm->display, gm->window, gm->gc, gm->ximage, 0,0,0,0, MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT);
+    XPutImage(gm->display, gm->window, gm->gc, gm->ximage, 0, 0, 0, 0, MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT);
     XFlush(gm->display);
     pthread_mutex_unlock(&gm->fb_mutex);
 }
 
 static int x11_init(GameManager* gm) {
     gm->display = XOpenDisplay(NULL);
-    if(!gm->display) return 0;
+    if (!gm->display) return 0;
     
     int s = DefaultScreen(gm->display);
-    gm->window = XCreateSimpleWindow(gm->display, RootWindow(gm->display,s),
-                                     50,50,MAIN_WINDOW_WIDTH,MAIN_WINDOW_HEIGHT,1,
-                                     BlackPixel(gm->display,s), 0x1A1A1A);
+    gm->window = XCreateSimpleWindow(gm->display, RootWindow(gm->display, s),
+                                     50, 50, MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT, 1,
+                                     BlackPixel(gm->display, s), 0x1A1A1A);
     XSelectInput(gm->display, gm->window,
-                 ExposureMask|KeyPressMask|KeyReleaseMask|ButtonPressMask|ButtonReleaseMask|PointerMotionMask|StructureNotifyMask);
-    XStoreName(gm->display, gm->window, "Game Hub");
+                 ExposureMask | KeyPressMask | KeyReleaseMask | ButtonPressMask | 
+                 ButtonReleaseMask | PointerMotionMask | StructureNotifyMask);
+    XStoreName(gm->display, gm->window, "SPANE Game Engine");
     XMapWindow(gm->display, gm->window);
     gm->gc = XCreateGC(gm->display, gm->window, 0, NULL);
     
-    // Create XImage for mirroring
     char* imgdata = malloc(MAIN_WINDOW_WIDTH * MAIN_WINDOW_HEIGHT * 4);
-    gm->ximage = XCreateImage(gm->display, DefaultVisual(gm->display,s), 24, ZPixmap, 0,
+    gm->ximage = XCreateImage(gm->display, DefaultVisual(gm->display, s), 24, ZPixmap, 0,
                               imgdata, MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT, 32, 0);
     
-    // Wait for window
     XEvent e;
-    do { XNextEvent(gm->display, &e); } while(e.type != MapNotify);
-    printf("X11 mirror ready\n");
+    do { XNextEvent(gm->display, &e); } while (e.type != MapNotify);
+    printf("X11 display ready\n");
     return 1;
 }
 
 static int x11_to_keycode(KeySym ks) {
-    if(ks==XK_Escape) return 27;
-    if(ks==XK_F1) return 112; if(ks==XK_F2) return 113;
-    if(ks==XK_Up||ks==XK_w||ks==XK_W) return 38;
-    if(ks==XK_Down||ks==XK_s||ks==XK_S) return 40;
-    if(ks==XK_Left||ks==XK_a||ks==XK_A) return 37;
-    if(ks==XK_Right||ks==XK_d||ks==XK_D) return 39;
-    if(ks==XK_r||ks==XK_R) return 82;
+    if (ks == XK_Escape) return 27;
+    if (ks == XK_F1) return 112;
+    if (ks == XK_F2) return 113;
+    if (ks == XK_F3) return 114;
+    if (ks == XK_F4) return 115;
+    if (ks == XK_Up || ks == XK_w || ks == XK_W) return 38;
+    if (ks == XK_Down || ks == XK_s || ks == XK_S) return 40;
+    if (ks == XK_Left || ks == XK_a || ks == XK_A) return 37;
+    if (ks == XK_Right || ks == XK_d || ks == XK_D) return 39;
+    if (ks == XK_r || ks == XK_R) return 82;
+    if (ks == XK_Return) return 13;
+    if (ks == XK_space) return 32;
     return 0;
 }
 
 static void x11_process(GameManager* gm, int* running) {
-    while(XPending(gm->display)) {
-        XEvent e; XNextEvent(gm->display, &e);
-        if(e.type == KeyPress) {
-            int k = x11_to_keycode(XLookupKeysym(&e.xkey,0));
-            if(k==27) *running=0;
-            else if(k==112) gm_switch(gm,0);
-            else if(k==113) gm_switch(gm,1);
-            else if(gm->games[gm->current_game]->active)
-                gm->games[gm->current_game]->handle_key(gm->games[gm->current_game],k,1);
+    while (XPending(gm->display)) {
+        XEvent e;
+        XNextEvent(gm->display, &e);
+        
+        if (e.type == KeyPress) {
+            int k = x11_to_keycode(XLookupKeysym(&e.xkey, 0));
+            if (k == 27) *running = 0;
+            else if (k >= 112 && k <= 115) gm_switch(gm, k - 112);
+            else if (gm->game_count > 0 && gm->current_game < gm->game_count 
+                     && gm->games[gm->current_game]->active)
+                gm->games[gm->current_game]->handle_key(gm->games[gm->current_game], k, 1);
         }
-        else if(e.type == KeyRelease) {
-            int k = x11_to_keycode(XLookupKeysym(&e.xkey,0));
-            if(k&&gm->games[gm->current_game]->active)
-                gm->games[gm->current_game]->handle_key(gm->games[gm->current_game],k,0);
+        else if (e.type == KeyRelease) {
+            int k = x11_to_keycode(XLookupKeysym(&e.xkey, 0));
+            if (k && gm->game_count > 0 && gm->current_game < gm->game_count 
+                && gm->games[gm->current_game]->active)
+                gm->games[gm->current_game]->handle_key(gm->games[gm->current_game], k, 0);
         }
-        else if(e.type == ButtonPress) gm_click(gm, e.xbutton.x, e.xbutton.y);
-        else if(e.type == MotionNotify) {
-            gm->mouse_x=e.xmotion.x; gm->mouse_y=e.xmotion.y; gm->hover_button=-1;
-            if(e.xmotion.x<SIDEBAR_WIDTH) {
-                int by=70;
-                for(int i=0;i<gm->game_count;i++) {
-                    if(e.xmotion.y>=by&&e.xmotion.y<by+40&&e.xmotion.x>=15&&e.xmotion.x<SIDEBAR_WIDTH-15)
-                        {gm->hover_button=i;break;}
-                    by+=55;
+        else if (e.type == ButtonPress) {
+            gm_click(gm, e.xbutton.x, e.xbutton.y);
+        }
+        else if (e.type == MotionNotify) {
+            gm->mouse_x = e.xmotion.x;
+            gm->mouse_y = e.xmotion.y;
+            gm->hover_button = -1;
+            if (e.xmotion.x < SIDEBAR_WIDTH) {
+                int by = 55;
+                for (int i = 0; i < gm->game_count; i++) {
+                    if (e.xmotion.y >= by && e.xmotion.y < by+35 
+                        && e.xmotion.x >= 10 && e.xmotion.x < SIDEBAR_WIDTH-10) {
+                        gm->hover_button = i;
+                        break;
+                    }
+                    by += 45;
                 }
             }
         }
@@ -476,25 +490,35 @@ static void x11_process(GameManager* gm, int* running) {
 }
 
 static void x11_cleanup(GameManager* gm) {
-    if(gm->ximage) { free(gm->ximage->data); gm->ximage->data=NULL; XDestroyImage(gm->ximage); }
-    if(gm->gc) XFreeGC(gm->display, gm->gc);
-    if(gm->window) XDestroyWindow(gm->display, gm->window);
-    if(gm->display) XCloseDisplay(gm->display);
+    if (gm->ximage) {
+        free(gm->ximage->data);
+        gm->ximage->data = NULL;
+        XDestroyImage(gm->ximage);
+    }
+    if (gm->gc) XFreeGC(gm->display, gm->gc);
+    if (gm->window) XDestroyWindow(gm->display, gm->window);
+    if (gm->display) XCloseDisplay(gm->display);
 }
 
-// ============================================
-// WEB SERVER MIRROR
-// ============================================
+// =============================================================================
+// WEB SERVER
+// =============================================================================
 
-typedef struct { int fd; GameManager* gm; pthread_t th; int run; } WS;
-static WS ws;
+typedef struct {
+    int fd;
+    GameManager* gm;
+    pthread_t th;
+    int run;
+} WebServer;
+
+static WebServer ws;
 
 static const char* html =
     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
-    "<!DOCTYPE html><html><head><title>Game Hub</title><style>"
+    "<!DOCTYPE html><html><head><title>SPANE Engine</title><style>"
     "body{margin:0;background:#000;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden}"
     "canvas{image-rendering:pixelated;cursor:crosshair}"
-    "#s{position:fixed;top:10px;left:10px;color:#0f0;font-size:14px;background:rgba(0,0,0,.7);padding:8px 12px;border-radius:4px;z-index:10}"
+    "#s{position:fixed;top:10px;left:10px;color:#0f0;font-size:14px;background:rgba(0,0,0,.7);padding:8px;border-radius:4px}"
     "</style></head><body><div id=s>Connecting...</div><canvas id=g></canvas><script>"
     "const s=document.getElementById('s'),c=document.getElementById('g'),x=c.getContext('2d'),W=1000,H=700;c.width=W;c.height=H;"
     "let img=x.createImageData(W,H),fc=0,lt=Date.now(),fps=0,con=0;"
@@ -514,124 +538,196 @@ static const char* html =
     "document.addEventListener('keyup',e=>{si('t=ku&k='+e.keyCode);e.preventDefault();});"
     "ff();</script></body></html>\n";
 
-static void whandle(WS* w, int cf) {
-    char b[16384]; int n=recv(cf,b,sizeof(b)-1,0);
-    if(n<=0) return; b[n]=0;
-    char m[16],p[512]; sscanf(b,"%15s %511s",m,p);
+static void whandle(WebServer* w, int cf) {
+    char b[16384];
+    int n = recv(cf, b, sizeof(b)-1, 0);
+    if (n <= 0) return;
+    b[n] = 0;
     
-    if(strcmp(p,"/")==0||strcmp(p,"/index.html")==0) send(cf,html,strlen(html),0);
-    else if(strncmp(p,"/f",2)==0) {
+    char m[16], p[512];
+    sscanf(b, "%15s %511s", m, p);
+    
+    if (strcmp(p, "/") == 0 || strcmp(p, "/index.html") == 0) {
+        send(cf, html, strlen(html), 0);
+    }
+    else if (strncmp(p, "/f", 2) == 0) {
         pthread_mutex_lock(&w->gm->fb_mutex);
-        int sz=MAIN_WINDOW_WIDTH*MAIN_WINDOW_HEIGHT*4;
-        char h[256]; int hl=snprintf(h,sizeof(h),"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\nCache-Control: no-cache,no-store\r\nConnection: close\r\n\r\n",sz);
-        send(cf,h,hl,0);
-        int sent=0;
-        while(sent<sz){int c=send(cf,w->gm->framebuffer.pixels+sent,sz-sent,0);if(c<=0)break;sent+=c;}
+        int sz = MAIN_WINDOW_WIDTH * MAIN_WINDOW_HEIGHT * 4;
+        char h[256];
+        int hl = snprintf(h, sizeof(h),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+            "Content-Length: %d\r\nCache-Control: no-cache,no-store\r\nConnection: close\r\n\r\n", sz);
+        send(cf, h, hl, 0);
+        int sent = 0;
+        while (sent < sz) {
+            int c = send(cf, w->gm->framebuffer.pixels + sent, sz - sent, 0);
+            if (c <= 0) break;
+            sent += c;
+        }
         pthread_mutex_unlock(&w->gm->fb_mutex);
     }
-    else if(strncmp(p,"/i?",3)==0) {
-        char*q=strchr(p,'?')+1,t[8]=""; int x=0,y=0,k=0;
-        char*tk=strtok(q,"&");
-        while(tk){
-            if(strncmp(tk,"t=",2)==0)sscanf(tk+2,"%7s",t);
-            else if(strncmp(tk,"x=",2)==0)sscanf(tk+2,"%d",&x);
-            else if(strncmp(tk,"y=",2)==0)sscanf(tk+2,"%d",&y);
-            else if(strncmp(tk,"k=",2)==0)sscanf(tk+2,"%d",&k);
-            tk=strtok(NULL,"&");
+    else if (strncmp(p, "/i?", 3) == 0) {
+        char* q = strchr(p, '?') + 1;
+        char t[8] = "";
+        int x = 0, y = 0, k = 0;
+        char* tk = strtok(q, "&");
+        while (tk) {
+            if (strncmp(tk, "t=", 2) == 0) sscanf(tk+2, "%7s", t);
+            else if (strncmp(tk, "x=", 2) == 0) sscanf(tk+2, "%d", &x);
+            else if (strncmp(tk, "y=", 2) == 0) sscanf(tk+2, "%d", &y);
+            else if (strncmp(tk, "k=", 2) == 0) sscanf(tk+2, "%d", &k);
+            tk = strtok(NULL, "&");
         }
         pthread_mutex_lock(&w->gm->fb_mutex);
-        if(strcmp(t,"m")==0){
-            w->gm->mouse_x=x;w->gm->mouse_y=y;w->gm->hover_button=-1;
-            if(x<SIDEBAR_WIDTH){int by=70;for(int i=0;i<w->gm->game_count;i++){if(y>=by&&y<by+40&&x>=15&&x<SIDEBAR_WIDTH-15){w->gm->hover_button=i;break;}by+=55;}}
+        if (strcmp(t, "m") == 0) {
+            w->gm->mouse_x = x;
+            w->gm->mouse_y = y;
+            w->gm->hover_button = -1;
+            if (x < SIDEBAR_WIDTH) {
+                int by = 55;
+                for (int i = 0; i < w->gm->game_count; i++) {
+                    if (y >= by && y < by+35 && x >= 10 && x < SIDEBAR_WIDTH-10) {
+                        w->gm->hover_button = i;
+                        break;
+                    }
+                    by += 45;
+                }
+            }
         }
-        else if(strcmp(t,"c")==0) gm_click(w->gm,x,y);
-        else if(strcmp(t,"kd")==0||strcmp(t,"ku")==0){
-            int pr=(t[1]=='d');
-            if(k==27)w->run=0;
-            else if(k==112&&pr)gm_switch(w->gm,0);
-            else if(k==113&&pr)gm_switch(w->gm,1);
-            else if(w->gm->games[w->gm->current_game]->active)w->gm->games[w->gm->current_game]->handle_key(w->gm->games[w->gm->current_game],k,pr);
+        else if (strcmp(t, "c") == 0) {
+            gm_click(w->gm, x, y);
+        }
+        else if (strcmp(t, "kd") == 0 || strcmp(t, "ku") == 0) {
+            int pr = (t[1] == 'd');
+            if (k == 27) w->run = 0;
+            else if (k >= 112 && k <= 115 && pr) gm_switch(w->gm, k - 112);
+            else if (w->gm->game_count > 0 && w->gm->current_game < w->gm->game_count 
+                     && w->gm->games[w->gm->current_game]->active)
+                w->gm->games[w->gm->current_game]->handle_key(w->gm->games[w->gm->current_game], k, pr);
         }
         pthread_mutex_unlock(&w->gm->fb_mutex);
-        send(cf,"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK",40,0);
-    } else send(cf,"HTTP/1.1 404\r\nContent-Length: 0\r\n\r\n",38,0);
+        send(cf, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK", 40, 0);
+    }
+    else {
+        send(cf, "HTTP/1.1 404\r\nContent-Length: 0\r\n\r\n", 38, 0);
+    }
 }
 
 static void* wthread(void* a) {
-    WS* w=(WS*)a;
-    w->fd=socket(AF_INET,SOCK_STREAM,0);
-    int o=1;setsockopt(w->fd,SOL_SOCKET,SO_REUSEADDR,&o,sizeof(o));
-    struct sockaddr_in ad;memset(&ad,0,sizeof(ad));ad.sin_family=AF_INET;ad.sin_addr.s_addr=INADDR_ANY;ad.sin_port=htons(WEB_PORT);
-    bind(w->fd,(struct sockaddr*)&ad,sizeof(ad));listen(w->fd,10);
-    printf("\n========================================\n  Web: http://localhost:%d\n========================================\n\n",WEB_PORT);
-    w->run=1;
-    while(w->run){
-        fd_set f;FD_ZERO(&f);FD_SET(w->fd,&f);struct timeval tv={0,50000};
-        if(select(w->fd+1,&f,0,0,&tv)>0){
-            struct sockaddr_in ca;socklen_t cl=sizeof(ca);int cf=accept(w->fd,(struct sockaddr*)&ca,&cl);
-            if(cf>=0){struct timeval to={5,0};setsockopt(cf,SOL_SOCKET,SO_RCVTIMEO,&to,sizeof(to));whandle(w,cf);close(cf);}
+    WebServer* w = (WebServer*)a;
+    w->fd = socket(AF_INET, SOCK_STREAM, 0);
+    int o = 1;
+    setsockopt(w->fd, SOL_SOCKET, SO_REUSEADDR, &o, sizeof(o));
+    
+    struct sockaddr_in ad;
+    memset(&ad, 0, sizeof(ad));
+    ad.sin_family = AF_INET;
+    ad.sin_addr.s_addr = INADDR_ANY;
+    ad.sin_port = htons(WEB_PORT);
+    
+    bind(w->fd, (struct sockaddr*)&ad, sizeof(ad));
+    listen(w->fd, 10);
+    
+    printf("\n========================================\n");
+    printf("  Web: http://localhost:%d\n", WEB_PORT);
+    printf("========================================\n\n");
+    
+    w->run = 1;
+    while (w->run) {
+        fd_set f;
+        FD_ZERO(&f);
+        FD_SET(w->fd, &f);
+        struct timeval tv = {0, 50000};
+        
+        if (select(w->fd+1, &f, 0, 0, &tv) > 0) {
+            struct sockaddr_in ca;
+            socklen_t cl = sizeof(ca);
+            int cf = accept(w->fd, (struct sockaddr*)&ca, &cl);
+            if (cf >= 0) {
+                struct timeval to = {5, 0};
+                setsockopt(cf, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
+                whandle(w, cf);
+                close(cf);
+            }
         }
     }
-    close(w->fd);return NULL;
+    close(w->fd);
+    return NULL;
 }
 
-// ============================================
+// =============================================================================
 // MAIN
-// ============================================
+// =============================================================================
+
+// In Spane.c, modify the main function to start with 0 games
+// and scan both current directory AND games subdirectory
 
 int main(int argc, char** argv) {
-    GameManager gm; memset(&gm,0,sizeof(gm));
-    pthread_mutex_init(&gm.fb_mutex,NULL);
+    GameManager gm;
+    memset(&gm, 0, sizeof(gm));
+    pthread_mutex_init(&gm.fb_mutex, NULL);
     
-    int web=0;
-    for(int i=1;i<argc;i++) if(strcmp(argv[i],"--web")==0) web=1;
+    int web = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--web") == 0) web = 1;
+    }
     
     // Try X11
     int has_x11 = x11_init(&gm);
-    if(!has_x11) { printf("No display - web mode\n"); web=1; }
-    if(web && has_x11) { x11_cleanup(&gm); memset(&gm.display,0,sizeof(Display*)+sizeof(Window)+sizeof(GC)+sizeof(XImage*)); has_x11=0; }
+    if (!has_x11) {
+        printf("No display available - using web mode\n");
+        web = 1;
+    }
+    if (web && has_x11) {
+        x11_cleanup(&gm);
+        memset(&gm.display, 0, sizeof(Display*) + sizeof(Window) + sizeof(GC) + sizeof(XImage*));
+        has_x11 = 0;
+    }
     
     gm.web_mode = web;
-    
-    // Create games
-    Game r={0},s={0};
-    strcpy(r.name,"RPG Adventure"); r.init=rpg_init;r.handle_key=rpg_key;r.handle_click=rpg_click;r.update=rpg_update;r.render=rpg_render;r.cleanup=rpg_cleanup;r.active=1;
-    strcpy(s.name,"Snake"); s.init=sn_init;s.handle_key=sn_key;s.handle_click=sn_click;s.update=sn_update;s.render=sn_render;s.cleanup=sn_cleanup;s.active=1;
-    gm_add(&gm,&r); gm_add(&gm,&s);
-    
-    for(int i=0;i<gm.game_count;i++) gm.games[i]->init(gm.games[i]);
-    srand(time(NULL)); gm.last_fps_update=time(NULL);
+    gm.game_count = 0;  // Start with 0 games
+    gm.current_game = -1;  // No game selected
     
     // Start web server if needed
-    if(web) { ws.gm=&gm; pthread_create(&ws.th,NULL,wthread,&ws); usleep(500000); }
+    if (web) {
+        ws.gm = &gm;
+        pthread_create(&ws.th, NULL, wthread, &ws);
+        usleep(500000);
+    }
     
-    printf("Engine running. %s mode.\n", web?"Web":"X11");
+    printf("SPANE Engine running in %s mode\n", web ? "Web" : "X11");
+    printf("Click [Load Game] to load game .so files\n");
+    printf("Place .so files in ./games/ and restart to auto-load\n\n");
     
-    int running=1;
-    while(running) {
-        // Process X11 input (if in X11 mode)
-        if(has_x11) x11_process(&gm, &running);
+    srand(time(NULL));
+    gm.last_fps_update = time(NULL);
+    
+    int running = 1;
+    while (running) {
+        if (has_x11) x11_process(&gm, &running);
+        if (web && !ws.run) running = 0;
         
-        // Check web server
-        if(web && !ws.run) running=0;
+        // Update current game
+        if (gm.game_count > 0 && gm.current_game >= 0 && gm.current_game < gm.game_count 
+            && gm.games[gm.current_game]->active 
+            && gm.games[gm.current_game]->update)
+            gm.games[gm.current_game]->update(gm.games[gm.current_game]);
         
-        // Update game
-        if(gm.games[gm.current_game]->active) gm.games[gm.current_game]->update(gm.games[gm.current_game]);
-        
-        // Render to framebuffer (headless)
         gm_render(&gm);
-        
-        // Mirror to X11 (just converts and displays pixels)
-        if(has_x11) x11_mirror_frame(&gm);
-        
+        if (has_x11) x11_mirror_frame(&gm);
         gm_fps(&gm);
         usleep(16667);
     }
     
     printf("Shutting down...\n");
-    for(int i=0;i<gm.game_count;i++) if(gm.games[i]->active) gm.games[i]->cleanup(gm.games[i]);
-    if(has_x11) x11_cleanup(&gm);
-    if(web) pthread_join(ws.th,NULL);
+    for (int i = 0; i < gm.game_count; i++) {
+        if (gm.games[i]->active && gm.games[i]->cleanup)
+            gm.games[i]->cleanup(gm.games[i]);
+        if (gm.games[i]->handle) dlclose(gm.games[i]->handle);
+    }
+    if (has_x11) x11_cleanup(&gm);
+    if (web) pthread_join(ws.th, NULL);
     pthread_mutex_destroy(&gm.fb_mutex);
+    
     return 0;
 }

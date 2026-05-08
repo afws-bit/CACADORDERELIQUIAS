@@ -11,6 +11,7 @@ PROJECT_DESCRIPTION="SPANE Game Engine - Multi-Game Platform"
 # INSTALLATION PATHS
 INSTALL_DIR="/usr/local/etc/$PROJECT_NAME"
 BIN_DIR="/usr/local/bin"
+GAMES_DIR="$INSTALL_DIR/games"
 
 # SOURCE PATHS
 REPO_DIR=$(pwd)
@@ -100,56 +101,27 @@ needs_x11() {
     return $?
 }
 
-# Recursively find all .c files, excluding .git
-find_c_files() {
-    find "$1" -type f -name "*.c" ! -path "*/.git/*" 2>/dev/null
+# Check if a C file has the create_game symbol (is a game shared library)
+is_game_library() {
+    c_file="$1"
+    grep -q "Game\* create_game" "$c_file" 2>/dev/null
+    return $?
 }
 
-# Compile all C files recursively
-compile_spane() {
-    log_message "Starting compilation..."
+# Check if a C file has main function (is an executable)
+has_main() {
+    c_file="$1"
+    grep -q "int main\s*(" "$c_file" 2>/dev/null
+    return $?
+}
+
+# Compile the main engine
+compile_engine() {
+    local engine_file="$1"
     
-    # Create build directory
-    rm -rf "$BUILD_DIR"
-    mkdir -p "$BUILD_DIR"
+    log_message "Compiling engine: $engine_file"
     
-    # Find main file
-    main_file=""
-    if [ -f "$MAIN_SOURCE_DIR/$MAIN_FILE" ]; then
-        main_file="$MAIN_SOURCE_DIR/$MAIN_FILE"
-    else
-        # Search for main function
-        main_file=$(find_c_files "$MAIN_SOURCE_DIR" | while read f; do
-            if grep -q "int main\s*(" "$f" 2>/dev/null; then
-                echo "$f"
-                break
-            fi
-        done)
-    fi
-    
-    if [ -z "$main_file" ]; then
-        log_message "Error: No main file found (looking for $MAIN_FILE or any file with main function)"
-        exit 1
-    fi
-    
-    log_message "Main file: $main_file"
-    
-    # Find all C files
-    all_files=$(find_c_files "$MAIN_SOURCE_DIR")
-    file_count=$(echo "$all_files" | wc -l)
-    log_message "Found $file_count C source files"
-    
-    # Copy files to build directory maintaining structure
-    echo "$all_files" | while IFS= read -r file; do
-        [ -z "$file" ] && continue
-        rel_path="${file#$MAIN_SOURCE_DIR/}"
-        mkdir -p "$BUILD_DIR/$(dirname "$rel_path")"
-        cp "$file" "$BUILD_DIR/$rel_path"
-    done
-    
-    cd "$BUILD_DIR" || exit 1
-    
-    # Detect X11 flags once
+    # Detect X11 flags
     X11_CFLAGS=""
     X11_LDFLAGS=""
     if pkg-config --exists x11 2>/dev/null; then
@@ -160,76 +132,115 @@ compile_spane() {
         X11_LDFLAGS="-L/usr/lib/x86_64-linux-gnu -lX11"
     fi
     
-    # Common flags
-    COMMON_CFLAGS="-O3 -march=native -pipe -flto -fomit-frame-pointer"
+    cd "$BUILD_DIR" || exit 1
     
-    # Compile each file, detecting if it needs X11
-    object_files=""
-    echo "$all_files" | while IFS= read -r file; do
-        [ -z "$file" ] && continue
-        rel_path="${file#$MAIN_SOURCE_DIR/}"
-        obj_file="${rel_path%.c}.o"
-        src_file="$BUILD_DIR/$rel_path"
+    # Compile engine
+    gcc -O3 -march=native -pipe -flto -fomit-frame-pointer \
+        $X11_CFLAGS \
+        -c "$engine_file" \
+        -o "$BUILD_DIR/spane_engine.o" 2>&1
+    
+    if [ $? -ne 0 ]; then
+        log_message "✗ Failed to compile engine"
+        return 1
+    fi
+    
+    # Link engine
+    gcc -O3 -flto \
+        "$BUILD_DIR/spane_engine.o" \
+        $X11_LDFLAGS \
+        -lm -ldl -lpthread \
+        -o "$BUILD_DIR/$BINARY_NAME" 2>&1
+    
+    if [ $? -ne 0 ]; then
+        log_message "✗ Failed to link engine"
+        return 1
+    fi
+    
+    strip "$BUILD_DIR/$BINARY_NAME" 2>/dev/null || true
+    log_message "✓ Engine compiled successfully"
+    return 0
+}
+
+# Compile all game .so files
+compile_games() {
+    log_message "Compiling game libraries..."
+    
+    # Find all game files (files with create_game but not main)
+    local games_dir="$MAIN_SOURCE_DIR/games"
+    mkdir -p "$BUILD_DIR/games"
+    
+    if [ ! -d "$games_dir" ]; then
+        mkdir -p "$games_dir"
+        log_message "Created games directory: $games_dir"
+    fi
+    
+    local compiled=0
+    local failed=0
+    
+    for game_file in "$games_dir"/*.c; do
+        [ ! -f "$game_file" ] && continue
         
-        # Determine if this file needs X11
-        if needs_x11 "$src_file"; then
-            CFLAGS="$COMMON_CFLAGS $X11_CFLAGS"
-            log_message "  Compiling with X11: $rel_path"
-        else
-            CFLAGS="$COMMON_CFLAGS"
-            log_message "  Compiling: $rel_path"
-        fi
+        local game_name=$(basename "$game_file" .c)
+        log_message "  Building game: $game_name"
         
-        mkdir -p "$(dirname "$BUILD_DIR/$obj_file")"
-        if gcc -c $CFLAGS "$src_file" -o "$BUILD_DIR/$obj_file" 2>/dev/null; then
-            echo "$obj_file" >> "$BUILD_DIR/objects.list"
+        # Compile shared library - NO main function needed
+        if gcc -shared -fPIC -O3 -march=native \
+            -o "$BUILD_DIR/games/${game_name}.so" \
+            "$game_file" 2>&1; then
+            log_message "  ✓ $game_name.so built"
+            compiled=$((compiled + 1))
         else
-            log_message "  ✗ Failed to compile: $rel_path"
+            log_message "  ✗ Failed to build $game_name"
+            failed=$((failed + 1))
         fi
     done
     
-    # Check if we have objects
-    if [ ! -f "$BUILD_DIR/objects.list" ]; then
-        log_message "Error: No files compiled successfully"
-        exit 1
-    fi
-    
-    object_files=$(cat "$BUILD_DIR/objects.list" | tr '\n' ' ')
-    obj_count=$(echo "$object_files" | wc -w)
-    log_message "Successfully compiled $obj_count object files"
-    
-    # Link everything
-    log_message "Linking $BINARY_NAME..."
-    if gcc -O3 -flto $object_files $X11_LDFLAGS -lm -o "$BUILD_DIR/$BINARY_NAME" 2>/dev/null; then
-        log_message "✓ Successfully built $BINARY_NAME"
-        strip "$BUILD_DIR/$BINARY_NAME" 2>/dev/null || true
-        return 0
-    else
-        log_message "✗ Linking failed"
-        return 1
-    fi
+    log_message "Games compiled: $compiled successful, $failed failed"
+    return 0
 }
 
-# Install binary globally
-install_binary() {
+# Install everything globally
+install_spane() {
     log_message "Installing SPANE engine globally..."
     
-    # Create installation directory
-    mkdir -p "$INSTALL_DIR"
-    mkdir -p "$BIN_DIR"
+    # Create directories
+    sudo mkdir -p "$INSTALL_DIR"
+    sudo mkdir -p "$GAMES_DIR"
+    sudo mkdir -p "$BIN_DIR"
     
-    # Copy binary
-    cp "$BUILD_DIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
-    chmod 755 "$INSTALL_DIR/$BINARY_NAME"
+    # Copy engine binary
+    sudo cp "$BUILD_DIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
+    sudo chmod 755 "$INSTALL_DIR/$BINARY_NAME"
     
-    # Remove old symlink if exists
-    [ -L "$BIN_DIR/$BINARY_NAME" ] && rm -f "$BIN_DIR/$BINARY_NAME"
+    # Copy game libraries
+    if [ -d "$BUILD_DIR/games" ]; then
+        sudo cp "$BUILD_DIR/games"/*.so "$GAMES_DIR/" 2>/dev/null
+        sudo chmod 644 "$GAMES_DIR"/*.so 2>/dev/null
+    fi
+    
+    # Create wrapper script that runs from games directory
+    sudo tee "$INSTALL_DIR/run_spane.sh" > /dev/null << 'EOF'
+#!/bin/sh
+# SPANE Engine Launcher
+ENGINE_DIR="/usr/local/etc/Spane"
+GAMES_DIR="$ENGINE_DIR/games"
+
+# Change to games directory so engine can find .so files
+cd "$GAMES_DIR" 2>/dev/null || cd "$ENGINE_DIR"
+
+# Run engine with arguments
+exec "$ENGINE_DIR/spane" "$@"
+EOF
+    sudo chmod 755 "$INSTALL_DIR/run_spane.sh"
     
     # Create symlink
-    ln -sf "$INSTALL_DIR/$BINARY_NAME" "$BIN_DIR/$BINARY_NAME"
+    [ -L "$BIN_DIR/$BINARY_NAME" ] && sudo rm -f "$BIN_DIR/$BINARY_NAME"
+    sudo ln -sf "$INSTALL_DIR/run_spane.sh" "$BIN_DIR/$BINARY_NAME"
     
-    log_message "✓ Installed to $INSTALL_DIR/$BINARY_NAME"
-    log_message "✓ Global command created: $BINARY_NAME"
+    log_message "✓ Installed to $INSTALL_DIR"
+    log_message "✓ Game libraries in $GAMES_DIR"
+    log_message "✓ Global command: $BINARY_NAME"
 }
 
 # Cleanup build files
@@ -244,8 +255,8 @@ cleanup() {
 uninstall_spane() {
     log_message "Uninstalling SPANE engine..."
     
-    [ -L "$BIN_DIR/$BINARY_NAME" ] && rm -f "$BIN_DIR/$BINARY_NAME"
-    [ -d "$INSTALL_DIR" ] && rm -rf "$INSTALL_DIR"
+    [ -L "$BIN_DIR/$BINARY_NAME" ] && sudo rm -f "$BIN_DIR/$BINARY_NAME"
+    [ -d "$INSTALL_DIR" ] && sudo rm -rf "$INSTALL_DIR"
     
     log_message "✓ SPANE engine uninstalled"
 }
@@ -262,6 +273,8 @@ show_help() {
     echo "  --help        Show this help"
     echo ""
     echo "After installation, run: spane"
+    echo "  spane           - X11 mode"
+    echo "  spane --web     - Web server mode (http://localhost:3000)"
 }
 
 # =============================================================================
@@ -292,7 +305,7 @@ if [ -d "$INSTALL_DIR" ]; then
     printf "Choose: [1]=Update [2]=Remove [3]=Exit: "
     read choice
     case "$choice" in
-        1) log_message "Updating..."; rm -rf "$INSTALL_DIR"; [ -L "$BIN_DIR/$BINARY_NAME" ] && rm -f "$BIN_DIR/$BINARY_NAME" ;;
+        1) log_message "Updating..."; sudo rm -rf "$INSTALL_DIR"; [ -L "$BIN_DIR/$BINARY_NAME" ] && sudo rm -f "$BIN_DIR/$BINARY_NAME" ;;
         2) uninstall_spane; exit 0 ;;
         *) exit 0 ;;
     esac
@@ -301,22 +314,58 @@ fi
 # Install dependencies
 install_dependencies
 
-# Compile
-if compile_spane; then
-    install_binary
+# Create build directory
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+
+# Find main engine file
+engine_file="$MAIN_SOURCE_DIR/$MAIN_FILE"
+if [ ! -f "$engine_file" ]; then
+    # Search for file with main function
+    engine_file=$(find "$MAIN_SOURCE_DIR" -maxdepth 1 -name "*.c" | while read f; do
+        if has_main "$f"; then
+            echo "$f"
+            break
+        fi
+    done)
+fi
+
+if [ -z "$engine_file" ] || [ ! -f "$engine_file" ]; then
+    log_message "Error: Could not find Spane.c or any file with main() function"
+    exit 1
+fi
+
+log_message "Engine source: $engine_file"
+
+# Compile engine
+if compile_engine "$engine_file"; then
+    # Compile games
+    compile_games
+    
+    # Install
+    install_spane
     cleanup
+    
+    # Count games
+    game_count=$(ls "$GAMES_DIR"/*.so 2>/dev/null | wc -l)
     
     echo ""
     echo "╔══════════════════════════════════════════╗"
     echo "║       Installation Complete!             ║"
     echo "║                                          ║"
     echo "║  Run with: spane                         ║"
+    echo "║  Web mode: spane --web                   ║"
+    echo "║                                          ║"
+    echo "║  Games installed: $game_count                    ║"
+    echo "║  Game location: $GAMES_DIR"
     echo "║                                          ║"
     echo "║  Controls:                               ║"
-    echo "║  - Arrow Keys/WASD: Move                 ║"
-    echo "║  - F1/F2: Switch games                   ║"
+    echo "║  - F1-F4: Switch games                   ║"
     echo "║  - Click sidebar: Switch games           ║"
     echo "║  - ESC: Quit                             ║"
+    echo "║                                          ║"
+    echo "║  Add games: Place .so files in:          ║"
+    echo "║  $GAMES_DIR"
     echo "║                                          ║"
     echo "╚══════════════════════════════════════════╝"
     echo ""
