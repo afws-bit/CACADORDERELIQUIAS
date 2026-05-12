@@ -740,8 +740,7 @@ static void x11_process(GameManager* gm, int* running) {
         
         if (e.type == KeyPress) {
             int k = x11_to_keycode(XLookupKeysym(&e.xkey, 0));
-            if (k == 27) *running = 0;
-            else if (k >= 112 && k <= 115) gm_switch(gm, k - 112);
+            if (k >= 112 && k <= 115) gm_switch(gm, k - 112);
             else if (gm->game_count > 0 && gm->current_game < gm->game_count 
                      && gm->games[gm->current_game]->active
                      && gm->games[gm->current_game]->handle_key)
