@@ -1,5 +1,5 @@
 // =============================================================================
-// SPANE GAME ENGINE - Multi-Instance Sync + Web Mode
+// SPANE GAME ENGINE - Multi-Instance Sync + Web Mode + Process Isolation
 // =============================================================================
 // Compile: gcc -O3 -o spane Spane.c -lX11 -lm -ldl -lpthread -lrt
 // Run: ./spane [--web] [--clear]
@@ -22,6 +22,8 @@
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
+#include <sys/prctl.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <errno.h>
@@ -43,6 +45,7 @@
 #define WEB_PORT 3000
 #define STATE_DIR "~/.spane"
 #define SHM_NAME "/spane_shared_state"
+#define GAME_SHM_PREFIX "/spane_game_"
 
 // =============================================================================
 // 5x7 BITMAP FONT (ASCII 32-126)
@@ -95,6 +98,7 @@ struct Framebuffer {
     unsigned char pixels[MAIN_WINDOW_WIDTH * MAIN_WINDOW_HEIGHT * 4];
 };
 
+// Game structure with function pointers
 struct Game {
     char name[64];
     char path[MAX_PATH];
@@ -110,6 +114,44 @@ struct Game {
     void (*cleanup)(Game* game);
 };
 
+// Game process communication structure
+typedef struct {
+    unsigned char framebuffer[MAIN_WINDOW_WIDTH * MAIN_WINDOW_HEIGHT * 4];
+    int ready;
+    int running;
+    int has_error;
+    char error_msg[1024];
+    int input_pending;
+    int input_type; // 0=none, 1=key, 2=click
+    int key_code;
+    int key_pressed;
+    int click_x;
+    int click_y;
+    int lock;
+} GameSharedMemory;
+
+// Engine's game wrapper with process isolation
+typedef struct {
+    char name[64];
+    char path[MAX_PATH];
+    int active;
+    int index;
+    
+    // Process isolation
+    pid_t pid;
+    int pipe_in[2];   // Engine -> Game process
+    int pipe_out[2];  // Game process -> Engine
+    GameSharedMemory* shm;
+    char shm_name[64];
+    int shm_fd;
+    
+    // Error handling
+    int has_error;
+    char error_msg[1024];
+    time_t error_time;
+    int restart_count;
+} GameProcess;
+
 typedef struct {
     int game_count;
     int current_game;
@@ -121,7 +163,7 @@ typedef struct {
 
 struct GameManager {
     Framebuffer framebuffer;
-    Game* games[MAX_GAMES];
+    GameProcess* games[MAX_GAMES];
     int game_count;
     int current_game;
     int hover_button;
@@ -155,14 +197,29 @@ static void sync_to_shared(GameManager* gm);
 static void scan_games_directory(GameManager* gm, const char* dir_path);
 static void save_disk_backup(GameManager* gm);
 static int load_disk_backup(GameManager* gm);
-static int load_game_from_so(GameManager* gm, const char* path);
 static void gm_render(GameManager* gm);
 static void gm_switch(GameManager* gm, int i);
 static void gm_click(GameManager* gm, int x, int y);
+static int load_game_from_so(GameManager* gm, const char* path);
+static int start_game_process(GameManager* gm, GameProcess* game);
+static void stop_game_process(GameManager* gm, GameProcess* game);
+static void check_game_processes(GameManager* gm);
+static void send_input_to_game(GameManager* gm, GameProcess* game, int type, int key_code, int pressed, int x, int y);
+static void game_process_main(GameManager* gm, GameProcess* game);
 
 // =============================================================================
 // SPINLOCK
 // =============================================================================
+
+static inline void game_shm_lock(GameSharedMemory* s) {
+    while (__sync_lock_test_and_set(&s->lock, 1)) {
+        usleep(10);
+    }
+}
+
+static inline void game_shm_unlock(GameSharedMemory* s) {
+    __sync_lock_release(&s->lock);
+}
 
 static inline void shm_lock(SharedState* s) {
     while (__sync_lock_test_and_set(&s->lock, 1)) {
@@ -296,18 +353,14 @@ static void sync_from_shared(GameManager* gm) {
     
     if (new_count != gm->game_count || new_current != gm->current_game) {
         for (int i = 0; i < gm->game_count; i++) {
-            if (gm->games[i]->active && gm->games[i]->cleanup)
-                gm->games[i]->cleanup(gm->games[i]);
-            if (gm->games[i]->handle) dlclose(gm->games[i]->handle);
+            stop_game_process(gm, gm->games[i]);
+            free(gm->games[i]);
             gm->games[i] = NULL;
         }
         gm->game_count = 0;
         
         for (int i = 0; i < new_count && i < MAX_GAMES; i++) {
-            if (load_game_from_so(gm, paths_to_load[i])) {
-                Game* game = gm->games[gm->game_count - 1];
-                if (game->init) game->init(game);
-            }
+            load_game_from_so(gm, paths_to_load[i]);
         }
         
         gm->current_game = new_current;
@@ -428,37 +481,461 @@ static void clear_all_state(GameManager* gm) {
 }
 
 // =============================================================================
-// GAME LOADER
+// GAME PROCESS ISOLATION
 // =============================================================================
 
-typedef Game* (*create_game_fn)();
-
-static int load_game_from_so(GameManager* gm, const char* path) {
-    void* handle = dlopen(path, RTLD_NOW);
-    if (!handle) return 0;
+static void game_process_main(GameManager* gm, GameProcess* game) {
+    // Child process - runs the game
+    prctl(PR_SET_PDEATHSIG, SIGKILL);
     
+    // Close unused pipe ends
+    close(game->pipe_in[1]);
+    close(game->pipe_out[0]);
+    
+    // Set up signal handler for clean exit
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGINT, SIG_DFL);
+    
+    // Load the game library
+    void* handle = dlopen(game->path, RTLD_NOW);
+    if (!handle) {
+        game_shm_lock(game->shm);
+        snprintf(game->shm->error_msg, sizeof(game->shm->error_msg),
+                "Failed to load game: %s", dlerror());
+        game->shm->has_error = 1;
+        game->shm->ready = 1;
+        game_shm_unlock(game->shm);
+        exit(1);
+    }
+    
+    typedef Game* (*create_game_fn)();
     create_game_fn create = (create_game_fn)dlsym(handle, "create_game");
-    if (!create) { dlclose(handle); return 0; }
-    
-    Game* game = create();
-    if (!game) { dlclose(handle); return 0; }
-    
-    game->handle = handle;
-    strncpy(game->path, path, MAX_PATH-1);
-    
-    if (!game->init || !game->render || !game->update || !game->cleanup) {
+    if (!create) {
+        game_shm_lock(game->shm);
+        snprintf(game->shm->error_msg, sizeof(game->shm->error_msg),
+                "Game missing 'create_game' symbol");
+        game->shm->has_error = 1;
+        game->shm->ready = 1;
+        game_shm_unlock(game->shm);
         dlclose(handle);
+        exit(1);
+    }
+    
+    Game* game_obj = create();
+    if (!game_obj) {
+        game_shm_lock(game->shm);
+        snprintf(game->shm->error_msg, sizeof(game->shm->error_msg),
+                "Game 'create_game' returned NULL");
+        game->shm->has_error = 1;
+        game->shm->ready = 1;
+        game_shm_unlock(game->shm);
+        dlclose(handle);
+        exit(1);
+    }
+    
+    // Validate required functions
+    if (!game_obj->init || !game_obj->render || !game_obj->update || !game_obj->cleanup) {
+        game_shm_lock(game->shm);
+        snprintf(game->shm->error_msg, sizeof(game->shm->error_msg),
+                "Game missing required functions (init/render/update/cleanup)");
+        game->shm->has_error = 1;
+        game->shm->ready = 1;
+        game_shm_unlock(game->shm);
+        dlclose(handle);
+        exit(1);
+    }
+    
+    // Try to initialize game
+    game_obj->init(game_obj);
+    
+    // Signal ready
+    game_shm_lock(game->shm);
+    game->shm->ready = 1;
+    game->shm->running = 1;
+    game_shm_unlock(game->shm);
+    
+    // Main game loop
+    Framebuffer fb;
+    
+    while (1) {
+        memset(&fb, 0, sizeof(fb));
+        
+        // Check for exit command
+        char cmd;
+        int n = read(game->pipe_in[0], &cmd, 1);
+        if (n <= 0 || cmd == 'Q') break;
+        
+        // Handle input
+        if (cmd == 'I') {
+            int type, key_code, pressed, x, y;
+            if (read(game->pipe_in[0], &type, sizeof(int)) != sizeof(int)) break;
+            if (read(game->pipe_in[0], &key_code, sizeof(int)) != sizeof(int)) break;
+            if (read(game->pipe_in[0], &pressed, sizeof(int)) != sizeof(int)) break;
+            if (read(game->pipe_in[0], &x, sizeof(int)) != sizeof(int)) break;
+            if (read(game->pipe_in[0], &y, sizeof(int)) != sizeof(int)) break;
+            
+            if (type == 1 && game_obj->handle_key) {
+                game_obj->handle_key(game_obj, key_code, pressed);
+            } else if (type == 2 && game_obj->handle_click) {
+                game_obj->handle_click(game_obj, x, y);
+            }
+        }
+        
+        // Update and render
+        game_obj->update(game_obj);
+        game_obj->render(game_obj, &fb);
+        
+        // Copy framebuffer to shared memory
+        game_shm_lock(game->shm);
+        memcpy(game->shm->framebuffer, fb.pixels, sizeof(fb.pixels));
+        game->shm->has_error = 0;
+        game_shm_unlock(game->shm);
+        
+        usleep(16667);
+    }
+    
+    // Cleanup
+    game_obj->cleanup(game_obj);
+    dlclose(handle);
+    
+    game_shm_lock(game->shm);
+    game->shm->running = 0;
+    game_shm_unlock(game->shm);
+    
+    exit(0);
+}
+
+static void cleanup_game_resources(GameProcess* game) {
+    // Close pipes
+    if (game->pipe_in[0] >= 0) { close(game->pipe_in[0]); game->pipe_in[0] = -1; }
+    if (game->pipe_in[1] >= 0) { close(game->pipe_in[1]); game->pipe_in[1] = -1; }
+    if (game->pipe_out[0] >= 0) { close(game->pipe_out[0]); game->pipe_out[0] = -1; }
+    if (game->pipe_out[1] >= 0) { close(game->pipe_out[1]); game->pipe_out[1] = -1; }
+    
+    // Cleanup shared memory
+    if (game->shm && game->shm != MAP_FAILED) {
+        munmap(game->shm, sizeof(GameSharedMemory));
+        game->shm = NULL;
+    }
+    
+    if (game->shm_fd >= 0) {
+        close(game->shm_fd);
+        game->shm_fd = -1;
+    }
+    
+    // Unlink shared memory
+    if (game->shm_name[0] != 0) {
+        shm_unlink(game->shm_name);
+        game->shm_name[0] = 0;
+    }
+    
+    game->active = 0;
+    game->pid = 0;
+}
+
+static int start_game_process(GameManager* gm, GameProcess* game) {
+    // First, clean up any previous resources
+    cleanup_game_resources(game);
+    
+    // Reset error state
+    game->has_error = 0;
+    game->error_msg[0] = 0;
+    
+    // Create unique shared memory name
+    snprintf(game->shm_name, sizeof(game->shm_name), "%s%d_%d_%d", 
+             GAME_SHM_PREFIX, getpid(), game->index, (int)time(NULL));
+    
+    // Remove any existing shared memory with this name
+    shm_unlink(game->shm_name);
+    
+    game->shm_fd = shm_open(game->shm_name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (game->shm_fd < 0) {
+        snprintf(game->error_msg, sizeof(game->error_msg), 
+                "Failed to create shared memory: %s", strerror(errno));
+        game->has_error = 1;
+        game->error_time = time(NULL);
+        cleanup_game_resources(game);
         return 0;
     }
     
-    if (gm->game_count < MAX_GAMES) {
+    if (ftruncate(game->shm_fd, sizeof(GameSharedMemory)) < 0) {
+        snprintf(game->error_msg, sizeof(game->error_msg), 
+                "Failed to resize shared memory: %s", strerror(errno));
+        game->has_error = 1;
+        game->error_time = time(NULL);
+        cleanup_game_resources(game);
+        return 0;
+    }
+    
+    game->shm = mmap(NULL, sizeof(GameSharedMemory), PROT_READ | PROT_WRITE, 
+                     MAP_SHARED, game->shm_fd, 0);
+    if (game->shm == MAP_FAILED) {
+        snprintf(game->error_msg, sizeof(game->error_msg), 
+                "Failed to map shared memory: %s", strerror(errno));
+        game->has_error = 1;
+        game->error_time = time(NULL);
+        cleanup_game_resources(game);
+        return 0;
+    }
+    
+    memset(game->shm, 0, sizeof(GameSharedMemory));
+    
+    // Create pipes for communication
+    if (pipe(game->pipe_in) < 0 || pipe(game->pipe_out) < 0) {
+        snprintf(game->error_msg, sizeof(game->error_msg), 
+                "Failed to create pipes: %s", strerror(errno));
+        game->has_error = 1;
+        game->error_time = time(NULL);
+        cleanup_game_resources(game);
+        return 0;
+    }
+    
+    // Fork game process
+    game->pid = fork();
+    if (game->pid < 0) {
+        snprintf(game->error_msg, sizeof(game->error_msg), 
+                "Failed to fork process: %s", strerror(errno));
+        game->has_error = 1;
+        game->error_time = time(NULL);
+        cleanup_game_resources(game);
+        return 0;
+    }
+    
+    if (game->pid == 0) {
+        // Child process
+        game_process_main(gm, game);
+        _exit(1);
+    }
+    
+    // Parent process - close child's ends of pipes
+    close(game->pipe_in[0]);
+    close(game->pipe_out[1]);
+    game->pipe_in[0] = -1;
+    game->pipe_out[1] = -1;
+    
+    // Wait for game to be ready with timeout
+    time_t start = time(NULL);
+    while (1) {
+        // Check if process is still alive
+        int status;
+        pid_t result = waitpid(game->pid, &status, WNOHANG);
+        if (result > 0) {
+            snprintf(game->error_msg, sizeof(game->error_msg), 
+                    "Game process crashed during startup (signal: %d)", 
+                    WTERMSIG(status));
+            game->has_error = 1;
+            game->error_time = time(NULL);
+            game->pid = 0;
+            printf("Game crashed on startup\n");
+            cleanup_game_resources(game);
+            return 0;
+        }
+        
+        // Check shared memory
+        game_shm_lock(game->shm);
+        int ready = game->shm->ready;
+        int has_error = game->shm->has_error;
+        if (has_error) {
+            strncpy(game->error_msg, game->shm->error_msg, sizeof(game->error_msg)-1);
+        }
+        game_shm_unlock(game->shm);
+        
+        if (ready) {
+            if (has_error) {
+                game->has_error = 1;
+                game->error_time = time(NULL);
+                printf("Game failed to start: %s\n", game->error_msg);
+                kill(game->pid, SIGKILL);
+                waitpid(game->pid, &status, 0);
+                cleanup_game_resources(game);
+                return 0;
+            }
+            
+            game->active = 1;
+            game->has_error = 0;
+            printf("Game started successfully (PID: %d)\n", game->pid);
+            return 1;
+        }
+        
+        // Timeout after 5 seconds
+        if (time(NULL) - start > 5) {
+            snprintf(game->error_msg, sizeof(game->error_msg), "Game startup timeout");
+            game->has_error = 1;
+            game->error_time = time(NULL);
+            kill(game->pid, SIGKILL);
+            waitpid(game->pid, &status, 0);
+            cleanup_game_resources(game);
+            return 0;
+        }
+        
+        usleep(10000);
+    }
+}
+
+
+static void stop_game_process(GameManager* gm, GameProcess* game) {
+    if (game->pid > 0) {
+        // Try to gracefully stop the game
+        if (game->pipe_in[1] >= 0) {
+            char cmd = 'Q';
+            write(game->pipe_in[1], &cmd, 1);
+        }
+        
+        // Give it a moment to clean up
+        usleep(100000);
+        
+        // Check if still running
+        int status;
+        if (waitpid(game->pid, &status, WNOHANG) == 0) {
+            // Still running, send SIGTERM
+            kill(game->pid, SIGTERM);
+            usleep(100000);
+            
+            // Force kill if still running
+            if (waitpid(game->pid, &status, WNOHANG) == 0) {
+                kill(game->pid, SIGKILL);
+                waitpid(game->pid, &status, 0);
+            }
+        }
+    }
+    
+    cleanup_game_resources(game);
+}
+
+static void send_input_to_game(GameManager* gm, GameProcess* game, int type, int key_code, int pressed, int x, int y) {
+    if (!game || !game->active || game->pid <= 0 || game->has_error) return;
+    if (game->pipe_in[1] < 0) return;
+    
+    // Check if process is still alive before sending
+    int status;
+    if (waitpid(game->pid, &status, WNOHANG) != 0) {
+        return;
+    }
+    
+    char cmd = 'I';
+    if (write(game->pipe_in[1], &cmd, 1) != 1) return;
+    if (write(game->pipe_in[1], &type, sizeof(int)) != sizeof(int)) return;
+    if (write(game->pipe_in[1], &key_code, sizeof(int)) != sizeof(int)) return;
+    if (write(game->pipe_in[1], &pressed, sizeof(int)) != sizeof(int)) return;
+    if (write(game->pipe_in[1], &x, sizeof(int)) != sizeof(int)) return;
+    if (write(game->pipe_in[1], &y, sizeof(int)) != sizeof(int)) return;
+}
+
+static void check_game_processes(GameManager* gm) {
+    for (int i = 0; i < gm->game_count; i++) {
+        GameProcess* game = gm->games[i];
+        if (!game->active || game->pid <= 0) continue;
+        
+        // Check if game process is still running
+        int status;
+        pid_t result = waitpid(game->pid, &status, WNOHANG);
+        if (result > 0) {
+            // Game process has terminated
+            printf("Game process terminated (PID: %d)\n", game->pid);
+            
+            // Check how it terminated
+            if (WIFEXITED(status)) {
+                int exit_code = WEXITSTATUS(status);
+                snprintf(game->error_msg, sizeof(game->error_msg), 
+                        "Game exited with code %d", exit_code);
+            } else if (WIFSIGNALED(status)) {
+                int sig = WTERMSIG(status);
+                snprintf(game->error_msg, sizeof(game->error_msg), 
+                        "Game crashed: signal %d (%s)", sig, strsignal(sig));
+            } else {
+                snprintf(game->error_msg, sizeof(game->error_msg), 
+                        "Game terminated unexpectedly");
+            }
+            
+            game->has_error = 1;
+            game->error_time = time(NULL);
+            
+            // Clean up resources
+            cleanup_game_resources(game);
+            
+            printf("Game error: %s\n", game->error_msg);
+        }
+    }
+}
+
+// =============================================================================
+// GAME LOADER
+// =============================================================================
+
+static int load_game_from_so(GameManager* gm, const char* path) {
+    if (gm->game_count >= MAX_GAMES) return 0;
+    
+    // Create game process structure
+    GameProcess* game = calloc(1, sizeof(GameProcess));
+    if (!game) return 0;
+    
+       strncpy(game->path, path, MAX_PATH-1);
+    game->index = gm->game_count;
+    
+    // Initialize all fds to -1
+    game->pipe_in[0] = -1;
+    game->pipe_in[1] = -1;
+    game->pipe_out[0] = -1;
+    game->pipe_out[1] = -1;
+    game->shm_fd = -1;
+    game->pid = 0;
+    game->active = 0;
+    game->has_error = 0;
+    game->restart_count = 0;
+    game->shm = NULL;
+    game->shm_name[0] = 0;
+    
+    // Try to get game name without fully loading it
+    void* handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        snprintf(game->error_msg, sizeof(game->error_msg), "Cannot load library: %s", dlerror());
+        game->has_error = 1;
+        game->error_time = time(NULL);
+        game->active = 0;
+        strncpy(game->name, "Invalid Game", sizeof(game->name)-1);
         gm->games[gm->game_count++] = game;
-        printf("Loaded: %s\n", game->name);
-        return 1;
+        return 0;
+    }
+    
+    typedef Game* (*create_game_fn)();
+    create_game_fn create = (create_game_fn)dlsym(handle, "create_game");
+    if (!create) {
+        snprintf(game->error_msg, sizeof(game->error_msg), "Missing 'create_game' symbol");
+        game->has_error = 1;
+        game->error_time = time(NULL);
+        game->active = 0;
+        strncpy(game->name, "Bad Plugin", sizeof(game->name)-1);
+        dlclose(handle);
+        gm->games[gm->game_count++] = game;
+        return 0;
+    }
+    
+    // Get name from game object
+    Game* temp = create();
+    if (temp && temp->name[0]) {
+        strncpy(game->name, temp->name, sizeof(game->name)-1);
+    } else {
+        // Extract name from filename
+        const char* fname = strrchr(path, '/');
+        if (!fname) fname = path;
+        else fname++;
+        strncpy(game->name, fname, sizeof(game->name)-1);
+        // Remove .so extension
+        char* dot = strstr(game->name, ".so");
+        if (dot) *dot = 0;
     }
     
     dlclose(handle);
-    return 0;
+    
+    // Add game to list
+    gm->games[gm->game_count++] = game;
+    
+    // Try to start game process
+    if (!start_game_process(gm, game)) {
+        printf("Game '%s' loaded with errors (will show error in game area)\n", game->name);
+    }
+    
+    return 1;
 }
 
 static void scan_games_directory(GameManager* gm, const char* dir_path) {
@@ -485,12 +962,13 @@ static void remove_game_instance(GameManager* gm, int index) {
     
     printf("Removing: %s\n", gm->games[index]->name);
     
-    if (gm->games[index]->active && gm->games[index]->cleanup)
-        gm->games[index]->cleanup(gm->games[index]);
-    if (gm->games[index]->handle) dlclose(gm->games[index]->handle);
+    stop_game_process(gm, gm->games[index]);
+    free(gm->games[index]);
     
-    for (int i = index; i < gm->game_count - 1; i++)
+    for (int i = index; i < gm->game_count - 1; i++) {
         gm->games[i] = gm->games[i+1];
+        gm->games[i]->index = i;
+    }
     gm->game_count--;
     
     if (gm->current_game >= gm->game_count)
@@ -507,6 +985,7 @@ static void gm_render(GameManager* gm) {
     pthread_mutex_lock(&gm->fb_mutex);
     Framebuffer* fb = &gm->framebuffer;
     
+    // First, render the engine UI
     fb_fill(fb, 0, 0, MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT, 0x1A, 0x1A, 0x1A);
     
     fb_fill(fb, 0, 0, SIDEBAR_WIDTH, MAIN_WINDOW_HEIGHT, 0x15, 0x15, 0x18);
@@ -519,12 +998,16 @@ static void gm_render(GameManager* gm) {
         int hov = (i == gm->hover_button);
         unsigned char r, g, b;
         
-        if (act) { r = 0x00; g = 0x88; b = 0xCC; }
+        if (gm->games[i]->has_error) { r = 0x88; g = 0x22; b = 0x22; }
+        else if (act) { r = 0x00; g = 0x88; b = 0xCC; }
         else if (hov) { r = 0xCC; g = 0x88; b = 0x00; }
         else { r = 0x25; g = 0x25; b = 0x2A; }
         
         fb_fill(fb, 10, by, SIDEBAR_WIDTH-35, 35, r, g, b);
-        fb_rect(fb, 10, by, SIDEBAR_WIDTH-35, 35, act ? 0x00:0x44, act ? 0xCC:0x44, act ? 0xFF:0x44);
+        fb_rect(fb, 10, by, SIDEBAR_WIDTH-35, 35, 
+                gm->games[i]->has_error ? 0xFF : (act ? 0x00:0x44),
+                gm->games[i]->has_error ? 0x44 : (act ? 0xCC:0x44),
+                gm->games[i]->has_error ? 0x44 : (act ? 0xFF:0x44));
         fb_text_center(fb, 10, by+12, SIDEBAR_WIDTH-35, gm->games[i]->name, 0xFF, 0xFF, 0xFF);
         
         int cx = SIDEBAR_WIDTH - 22;
@@ -549,19 +1032,67 @@ static void gm_render(GameManager* gm) {
              gm->web_mode ? "WEB" : "X11");
     fb_text(fb, 10, MAIN_WINDOW_HEIGHT - 25, info, 0x88, 0x88, 0x88);
     
+    // Draw game area border
     for (int t = 0; t < 2; t++)
         fb_rect(fb, GAME_AREA_X-t-1, GAME_AREA_Y-t-1, GAME_AREA_WIDTH+2*t+2, GAME_AREA_HEIGHT+2*t+2, 0x44, 0x44, 0x55);
     
-    for (int i = 0; i < gm->game_count; i++) {
-        if (gm->games[i]->active && gm->games[i]->render && i == gm->current_game) {
-            char lb[128];
-            snprintf(lb, sizeof(lb), "Game: %s", gm->games[i]->name);
-            fb_text(fb, GAME_AREA_X, GAME_AREA_Y-15, lb, 0xCC, 0xCC, 0xCC);
-            gm->games[i]->render(gm->games[i], fb);
+    // Now render the current game INTO THE GAME AREA ONLY
+    if (gm->current_game >= 0 && gm->current_game < gm->game_count) {
+        GameProcess* game = gm->games[gm->current_game];
+        
+        char lb[128];
+        snprintf(lb, sizeof(lb), "Game: %s%s", game->name, 
+                game->has_error ? " [ERROR]" : (game->active ? "" : " [LOADING]"));
+        fb_text(fb, GAME_AREA_X, GAME_AREA_Y-15, lb, 
+                game->has_error ? 0xFF : 0xCC, 
+                game->has_error ? 0x44 : 0xCC, 
+                game->has_error ? 0x44 : 0xCC);
+        
+        if (game->has_error) {
+            // Show error in game area
+            fb_fill(fb, GAME_AREA_X, GAME_AREA_Y, GAME_AREA_WIDTH, GAME_AREA_HEIGHT, 0x2A, 0x1A, 0x1A);
+            fb_rect(fb, GAME_AREA_X, GAME_AREA_Y, GAME_AREA_WIDTH, GAME_AREA_HEIGHT, 0xFF, 0x44, 0x44);
+            
+            fb_text_center(fb, GAME_AREA_X, GAME_AREA_Y + 200, GAME_AREA_WIDTH, 
+                          "GAME ERROR", 0xFF, 0x44, 0x44);
+            fb_text_center(fb, GAME_AREA_X, GAME_AREA_Y + 220, GAME_AREA_WIDTH, 
+                          game->error_msg, 0xFF, 0x88, 0x88);
+            fb_text_center(fb, GAME_AREA_X, GAME_AREA_Y + 240, GAME_AREA_WIDTH, 
+                          "The engine continues running normally.", 0xAA, 0xAA, 0xAA);
+            
+            if (game->restart_count < 3) {
+                fb_text_center(fb, GAME_AREA_X, GAME_AREA_Y + 270, GAME_AREA_WIDTH, 
+                              "Click to attempt restart", 0x00, 0xFF, 0x00);
+            } else {
+                fb_text_center(fb, GAME_AREA_X, GAME_AREA_Y + 270, GAME_AREA_WIDTH, 
+                              "Too many restart attempts. Reload the game.", 0xFF, 0xAA, 0x00);
+            }
+        } else if (game->active && game->shm) {
+            // FIXED: Copy only the game area from shared memory to main framebuffer
+            // Instead of copying entire framebuffer (which overwrites UI)
+            game_shm_lock(game->shm);
+            
+            // Copy pixel by pixel only within the game area
+            for (int gy = 0; gy < GAME_AREA_HEIGHT; gy++) {
+                for (int gx = 0; gx < GAME_AREA_WIDTH; gx++) {
+                    int src_idx = ((gy + GAME_AREA_Y) * MAIN_WINDOW_WIDTH + (gx + GAME_AREA_X)) * 4;
+                    int dst_idx = ((gy + GAME_AREA_Y) * MAIN_WINDOW_WIDTH + (gx + GAME_AREA_X)) * 4;
+                    
+                    // Only copy if the pixel in shared memory is not fully transparent
+                    // (This allows the game to have transparency if needed)
+                    fb->pixels[dst_idx] = game->shm->framebuffer[src_idx];
+                    fb->pixels[dst_idx + 1] = game->shm->framebuffer[src_idx + 1];
+                    fb->pixels[dst_idx + 2] = game->shm->framebuffer[src_idx + 2];
+                    fb->pixels[dst_idx + 3] = 255;
+                }
+            }
+            
+            game_shm_unlock(game->shm);
+        } else {
+            fb_text_center(fb, GAME_AREA_X, GAME_AREA_Y + GAME_AREA_HEIGHT/2, GAME_AREA_WIDTH,
+                          "Loading game...", 0xCC, 0xCC, 0xCC);
         }
-    }
-    
-    if (gm->game_count == 0) {
+    } else if (gm->game_count == 0) {
         fb_text_center(fb, GAME_AREA_X, GAME_AREA_Y + GAME_AREA_HEIGHT/2, GAME_AREA_WIDTH,
                        "Click [Load Game] to add a game", 0x66, 0x66, 0x66);
     }
@@ -579,6 +1110,22 @@ static void gm_switch(GameManager* gm, int i) {
 static void gm_click(GameManager* gm, int x, int y) {
     int lby = MAIN_WINDOW_HEIGHT - 110;
     
+    // Check if clicking on error game area for restart
+    if (gm->current_game >= 0 && gm->current_game < gm->game_count) {
+        GameProcess* game = gm->games[gm->current_game];
+        if (game->has_error && x >= GAME_AREA_X && x < GAME_AREA_X + GAME_AREA_WIDTH
+            && y >= GAME_AREA_Y && y < GAME_AREA_Y + GAME_AREA_HEIGHT) {
+            if (game->restart_count < 3) {
+                printf("Attempting to restart game '%s'...\n", game->name);
+                game->restart_count++;
+                game->has_error = 0;
+                game->error_msg[0] = 0;
+                start_game_process(gm, game);
+            }
+            return;
+        }
+    }
+    
     if (x >= 10 && x < SIDEBAR_WIDTH-10) {
         if (y >= lby && y < lby+28) {
             int ret __attribute__((unused));
@@ -591,8 +1138,6 @@ static void gm_click(GameManager* gm, int x, int y) {
                 if (fgets(path, sizeof(path), f)) {
                     path[strcspn(path, "\n")] = 0;
                     if (strlen(path) > 0 && load_game_from_so(gm, path)) {
-                        Game* g = gm->games[gm->game_count - 1];
-                        if (g->init) g->init(g);
                         gm->current_game = gm->game_count - 1;
                         sync_to_shared(gm);
                         save_disk_backup(gm);
@@ -606,9 +1151,8 @@ static void gm_click(GameManager* gm, int x, int y) {
         
         if (y >= lby+33 && y < lby+61) {
             for (int i = 0; i < gm->game_count; i++) {
-                if (gm->games[i]->active && gm->games[i]->cleanup)
-                    gm->games[i]->cleanup(gm->games[i]);
-                if (gm->games[i]->handle) dlclose(gm->games[i]->handle);
+                stop_game_process(gm, gm->games[i]);
+                free(gm->games[i]);
             }
             gm->game_count = 0;
             gm->current_game = -1;
@@ -632,9 +1176,8 @@ static void gm_click(GameManager* gm, int x, int y) {
             by += 45;
         }
     } else if (gm->game_count > 0 && gm->current_game < gm->game_count 
-               && gm->games[gm->current_game]->active
-               && gm->games[gm->current_game]->handle_click) {
-        gm->games[gm->current_game]->handle_click(gm->games[gm->current_game], x, y);
+               && gm->games[gm->current_game]->active) {
+        send_input_to_game(gm, gm->games[gm->current_game], 2, 0, 0, x, y);
     }
 }
 
@@ -742,16 +1285,14 @@ static void x11_process(GameManager* gm, int* running) {
             int k = x11_to_keycode(XLookupKeysym(&e.xkey, 0));
             if (k >= 112 && k <= 115) gm_switch(gm, k - 112);
             else if (gm->game_count > 0 && gm->current_game < gm->game_count 
-                     && gm->games[gm->current_game]->active
-                     && gm->games[gm->current_game]->handle_key)
-                gm->games[gm->current_game]->handle_key(gm->games[gm->current_game], k, 1);
+                     && gm->games[gm->current_game]->active)
+                send_input_to_game(gm, gm->games[gm->current_game], 1, k, 1, 0, 0);
         }
         else if (e.type == KeyRelease) {
             int k = x11_to_keycode(XLookupKeysym(&e.xkey, 0));
             if (k && gm->game_count > 0 && gm->current_game < gm->game_count 
-                && gm->games[gm->current_game]->active
-                && gm->games[gm->current_game]->handle_key)
-                gm->games[gm->current_game]->handle_key(gm->games[gm->current_game], k, 0);
+                && gm->games[gm->current_game]->active)
+                send_input_to_game(gm, gm->games[gm->current_game], 1, k, 0, 0, 0);
         }
         else if (e.type == ButtonPress) {
             gm_click(gm, e.xbutton.x, e.xbutton.y);
@@ -864,7 +1405,6 @@ static void whandle(WebServer* w, int cf) {
         if (strcmp(t, "m") == 0) {
             w->gm->mouse_x = x;
             w->gm->mouse_y = y;
-            // Add hover detection - same logic as X11 version
             w->gm->hover_button = -1;
             if (x < SIDEBAR_WIDTH) {
                 int by = 55;
@@ -886,9 +1426,8 @@ static void whandle(WebServer* w, int cf) {
             if (k == 27) w->run = 0;
             else if (k >= 112 && k <= 115 && pr) gm_switch(w->gm, k - 112);
             else if (w->gm->game_count > 0 && w->gm->current_game < w->gm->game_count 
-                     && w->gm->games[w->gm->current_game]->active
-                     && w->gm->games[w->gm->current_game]->handle_key)
-                w->gm->games[w->gm->current_game]->handle_key(w->gm->games[w->gm->current_game], k, pr);
+                     && w->gm->games[w->gm->current_game]->active)
+                send_input_to_game(w->gm, w->gm->games[w->gm->current_game], 1, k, pr, 0, 0);
         }
         pthread_mutex_unlock(&w->gm->fb_mutex);
         send(cf, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK", 40, 0);
@@ -944,7 +1483,14 @@ static void* wthread(void* a) {
 // MAIN
 // =============================================================================
 
+// =============================================================================
+// MAIN
+// =============================================================================
+
 int main(int argc, char** argv) {
+    // Ignore SIGCHLD to prevent zombie processes
+    signal(SIGCHLD, SIG_IGN);
+    
     GameManager gm;
     memset(&gm, 0, sizeof(gm));
     pthread_mutex_init(&gm.fb_mutex, NULL);
@@ -990,6 +1536,7 @@ int main(int argc, char** argv) {
     }
     
     printf("SPANE Engine - Instance #%d (%s)\n", gm.instance_id + 1, web ? "Web" : "X11");
+    printf("Process isolation: ENABLED\n");
     
     srand(time(NULL));
     gm.last_fps_update = time(NULL);
@@ -1002,9 +1549,6 @@ int main(int argc, char** argv) {
     
     if (gm.game_count > 0) {
         gm.current_game = 0;
-        for (int i = 0; i < gm.game_count; i++) {
-            if (gm.games[i]->init) gm.games[i]->init(gm.games[i]);
-        }
         sync_to_shared(&gm);
     }
     
@@ -1015,11 +1559,8 @@ int main(int argc, char** argv) {
         if (has_x11) x11_process(&gm, &running);
         if (web && !ws.run) running = 0;
         
-        // Update ALL games
-        for (int i = 0; i < gm.game_count; i++) {
-            if (gm.games[i]->active && gm.games[i]->update)
-                gm.games[i]->update(gm.games[i]);
-        }
+        // Check game processes for crashes
+        check_game_processes(&gm);
         
         gm_render(&gm);
         if (has_x11) x11_mirror_frame(&gm);
@@ -1040,11 +1581,12 @@ int main(int argc, char** argv) {
     printf("Shutting down...\n");
     save_disk_backup(&gm);
     
+    // Fixed: use gm.games[i] instead of gm->games[i]
     for (int i = 0; i < gm.game_count; i++) {
-        if (gm.games[i]->active && gm.games[i]->cleanup)
-            gm.games[i]->cleanup(gm.games[i]);
-        if (gm.games[i]->handle) dlclose(gm.games[i]->handle);
+        stop_game_process(&gm, gm.games[i]);
+        free(gm.games[i]);
     }
+    
     if (has_x11) x11_cleanup(&gm);
     if (web) {
         ws.run = 0;
