@@ -1,5 +1,5 @@
 // =============================================================================
-// SPANE GAME ENGINE - Multi-Instance Sync + Web Mode
+// SPANE GAME ENGINE - Multi-Instance Sync + Web Mode + Process Isolation
 // =============================================================================
 // Compile: gcc -O3 -o spane Spane.c -lX11 -lm -ldl -lpthread -lrt
 // Run: ./spane [--web] [--clear]
@@ -8,6 +8,7 @@
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
 #include <X11/Xutil.h>
+#include <X11/Xatom.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +23,8 @@
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
+#include <sys/prctl.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <errno.h>
@@ -43,6 +46,7 @@
 #define WEB_PORT 3000
 #define STATE_DIR "~/.spane"
 #define SHM_NAME "/spane_shared_state"
+#define GAME_SHM_PREFIX "/spane_game_"
 
 // =============================================================================
 // 5x7 BITMAP FONT (ASCII 32-126)
@@ -95,6 +99,7 @@ struct Framebuffer {
     unsigned char pixels[MAIN_WINDOW_WIDTH * MAIN_WINDOW_HEIGHT * 4];
 };
 
+// Game structure with function pointers
 struct Game {
     char name[64];
     char path[MAX_PATH];
@@ -110,6 +115,47 @@ struct Game {
     void (*cleanup)(Game* game);
 };
 
+// Game process communication structure
+typedef struct {
+    unsigned char framebuffer[MAIN_WINDOW_WIDTH * MAIN_WINDOW_HEIGHT * 4];
+    int ready;
+    int running;
+    int has_error;
+    char error_msg[1024];
+    int input_pending;
+    int input_type;
+    int key_code;
+    int key_pressed;
+    int click_x;
+    int click_y;
+    int lock;
+    int frame_ready;
+} GameSharedMemory;
+
+// Engine's game wrapper with process isolation
+typedef struct {
+    char name[64];
+    char path[MAX_PATH];
+    int active;
+    int index;
+    
+    // Process isolation
+    pid_t pid;
+    int pipe_in[2];
+    int pipe_out[2];
+    GameSharedMemory* shm;
+    char shm_name[64];
+    int shm_fd;
+    
+    // Error handling
+    int has_error;
+    char error_msg[1024];
+    time_t error_time;
+    int restart_count;
+    int error_dialog;
+    int error_dialog_button;
+} GameProcess;
+
 typedef struct {
     int game_count;
     int current_game;
@@ -121,7 +167,7 @@ typedef struct {
 
 struct GameManager {
     Framebuffer framebuffer;
-    Game* games[MAX_GAMES];
+    GameProcess* games[MAX_GAMES];
     int game_count;
     int current_game;
     int hover_button;
@@ -144,6 +190,8 @@ struct GameManager {
     int local_version;
     
     char state_dir[512];
+    
+    Atom wm_delete_window;
 };
 
 // =============================================================================
@@ -155,14 +203,30 @@ static void sync_to_shared(GameManager* gm);
 static void scan_games_directory(GameManager* gm, const char* dir_path);
 static void save_disk_backup(GameManager* gm);
 static int load_disk_backup(GameManager* gm);
-static int load_game_from_so(GameManager* gm, const char* path);
 static void gm_render(GameManager* gm);
 static void gm_switch(GameManager* gm, int i);
 static void gm_click(GameManager* gm, int x, int y);
+static int load_game_from_so(GameManager* gm, const char* path);
+static int start_game_process(GameManager* gm, GameProcess* game);
+static void stop_game_process(GameManager* gm, GameProcess* game);
+static void check_game_processes(GameManager* gm);
+static void send_input_to_game(GameManager* gm, GameProcess* game, int type, int key_code, int pressed, int x, int y);
+static void game_process_main(GameManager* gm, GameProcess* game);
+static void render_error_dialog(Framebuffer* fb, GameProcess* game, GameManager* gm);
 
 // =============================================================================
 // SPINLOCK
 // =============================================================================
+
+static inline void game_shm_lock(GameSharedMemory* s) {
+    while (__sync_lock_test_and_set(&s->lock, 1)) {
+        usleep(10);
+    }
+}
+
+static inline void game_shm_unlock(GameSharedMemory* s) {
+    __sync_lock_release(&s->lock);
+}
 
 static inline void shm_lock(SharedState* s) {
     while (__sync_lock_test_and_set(&s->lock, 1)) {
@@ -222,6 +286,7 @@ static void expand_path(const char* path, char* expanded, int max_len) {
         snprintf(expanded, max_len, "%s%s", home, path + 1);
     } else {
         strncpy(expanded, path, max_len - 1);
+        expanded[max_len-1] = 0;
     }
 }
 
@@ -233,6 +298,7 @@ static int ensure_state_directory(GameManager* gm) {
     char expanded[512];
     expand_path(STATE_DIR, expanded, sizeof(expanded));
     strncpy(gm->state_dir, expanded, sizeof(gm->state_dir) - 1);
+    gm->state_dir[sizeof(gm->state_dir)-1] = 0;
     mkdir(expanded, 0755);
     return 1;
 }
@@ -290,24 +356,23 @@ static void sync_from_shared(GameManager* gm) {
     
     for (int i = 0; i < new_count && i < MAX_GAMES; i++) {
         strncpy(paths_to_load[i], gm->shared->game_paths[i], MAX_PATH-1);
+        paths_to_load[i][MAX_PATH-1] = 0;
     }
     
     shm_unlock(gm->shared);
     
     if (new_count != gm->game_count || new_current != gm->current_game) {
         for (int i = 0; i < gm->game_count; i++) {
-            if (gm->games[i]->active && gm->games[i]->cleanup)
-                gm->games[i]->cleanup(gm->games[i]);
-            if (gm->games[i]->handle) dlclose(gm->games[i]->handle);
-            gm->games[i] = NULL;
+            if (gm->games[i]) {
+                stop_game_process(gm, gm->games[i]);
+                free(gm->games[i]);
+                gm->games[i] = NULL;
+            }
         }
         gm->game_count = 0;
         
         for (int i = 0; i < new_count && i < MAX_GAMES; i++) {
-            if (load_game_from_so(gm, paths_to_load[i])) {
-                Game* game = gm->games[gm->game_count - 1];
-                if (game->init) game->init(game);
-            }
+            load_game_from_so(gm, paths_to_load[i]);
         }
         
         gm->current_game = new_current;
@@ -325,7 +390,10 @@ static void sync_to_shared(GameManager* gm) {
     if (gm->shared->game_count != gm->game_count) {
         gm->shared->game_count = gm->game_count;
         for (int i = 0; i < gm->game_count && i < MAX_GAMES; i++) {
-            strncpy(gm->shared->game_paths[i], gm->games[i]->path, MAX_PATH-1);
+            if (gm->games[i]) {
+                strncpy(gm->shared->game_paths[i], gm->games[i]->path, MAX_PATH-1);
+                gm->shared->game_paths[i][MAX_PATH-1] = 0;
+            }
         }
         changed = 1;
     }
@@ -428,37 +496,573 @@ static void clear_all_state(GameManager* gm) {
 }
 
 // =============================================================================
-// GAME LOADER
+// ERROR DIALOG RENDERING
 // =============================================================================
 
-typedef Game* (*create_game_fn)();
+static void render_error_dialog(Framebuffer* fb, GameProcess* game, GameManager* gm) {
+    int dx = GAME_AREA_X + 100;
+    int dy = GAME_AREA_Y + 150;
+    int dw = GAME_AREA_WIDTH - 200;
+    int dh = 300;
+    
+    // Dim the game area behind dialog
+    for (int yy = GAME_AREA_Y; yy < GAME_AREA_Y + GAME_AREA_HEIGHT; yy++) {
+        for (int xx = GAME_AREA_X; xx < GAME_AREA_X + GAME_AREA_WIDTH; xx++) {
+            int i = (yy * MAIN_WINDOW_WIDTH + xx) * 4;
+            fb->pixels[i] = fb->pixels[i] / 3;
+            fb->pixels[i+1] = fb->pixels[i+1] / 3;
+            fb->pixels[i+2] = fb->pixels[i+2] / 3;
+        }
+    }
+    
+    // Dialog background with shadow
+    fb_fill(fb, dx + 4, dy + 4, dw, dh, 0x00, 0x00, 0x00);
+    fb_fill(fb, dx, dy, dw, dh, 0x2A, 0x2A, 0x35);
+    fb_rect(fb, dx, dy, dw, dh, 0xCC, 0x44, 0x44);
+    fb_rect(fb, dx+1, dy+1, dw-2, dh-2, 0x88, 0x44, 0x44);
+    
+    // Title bar
+    fb_fill(fb, dx+2, dy+2, dw-4, 30, 0x88, 0x22, 0x22);
+    fb_text_center(fb, dx+2, dy+7, dw-4, "GAME CRASHED", 0xFF, 0xFF, 0xFF);
+    
+    // Error message
+    fb_text_center(fb, dx+2, dy+45, dw-4, "The game process has stopped unexpectedly.", 0xFF, 0x88, 0x88);
+    
+    // Error details
+    char error_line[128];
+    snprintf(error_line, sizeof(error_line), "Error: %s", game->error_msg);
+    
+    int text_y = dy + 70;
+    const char* msg = error_line;
+    char line_buffer[64];
+    while (*msg && text_y < dy + dh - 80) {
+        int len = 0;
+        while (msg[len] && len < 50) len++;
+        if (len > 50) {
+            int space = len;
+            while (space > 0 && msg[space] != ' ') space--;
+            if (space > 0) len = space;
+        }
+        memcpy(line_buffer, msg, len);
+        line_buffer[len] = 0;
+        fb_text_center(fb, dx+2, text_y, dw-4, line_buffer, 0xCC, 0x88, 0x88);
+        text_y += 12;
+        msg += len;
+        if (*msg == ' ') msg++;
+    }
+    
+    // Restart attempts
+    char attempts[64];
+    snprintf(attempts, sizeof(attempts), "Restart attempts: %d/3", game->restart_count);
+    fb_text_center(fb, dx+2, text_y + 15, dw-4, attempts, 0xAA, 0xAA, 0xAA);
+    
+    if (game->restart_count >= 3) {
+        fb_text_center(fb, dx+2, text_y + 30, dw-4, "Maximum restart attempts reached.", 0xFF, 0x66, 0x00);
+    }
+    
+    // Buttons
+    int btn_w = 180;
+    int btn_h = 40;
+    int btn_y = dy + dh - 70;
+    
+    // Restart button
+    int restart_x = dx + (dw/2) - btn_w - 20;
+    unsigned char rr = 0x00, rg = 0x88, rb = 0x00;
+    if (game->error_dialog_button == 0) { rr = 0x00; rg = 0xCC; rb = 0x00; }
+    fb_fill(fb, restart_x, btn_y, btn_w, btn_h, rr, rg, rb);
+    fb_rect(fb, restart_x, btn_y, btn_w, btn_h, 0x00, 0xFF, 0x00);
+    fb_text_center(fb, restart_x, btn_y + 14, btn_w, "[ RESTART GAME ]", 0xFF, 0xFF, 0xFF);
+    
+    // Close button
+    int close_x = dx + (dw/2) + 20;
+    unsigned char cr = 0x88, cg = 0x22, cb = 0x22;
+    if (game->error_dialog_button == 1) { cr = 0xCC; cg = 0x00; cb = 0x00; }
+    fb_fill(fb, close_x, btn_y, btn_w, btn_h, cr, cg, cb);
+    fb_rect(fb, close_x, btn_y, btn_w, btn_h, 0xFF, 0x44, 0x44);
+    fb_text_center(fb, close_x, btn_y + 14, btn_w, "[ CLOSE GAME ]", 0xFF, 0xFF, 0xFF);
+}
 
-static int load_game_from_so(GameManager* gm, const char* path) {
-    void* handle = dlopen(path, RTLD_NOW);
-    if (!handle) return 0;
+// =============================================================================
+// GAME PROCESS ISOLATION
+// =============================================================================
+
+static void game_process_main(GameManager* gm, GameProcess* game) {
+    // Child process - runs the game
+    // Do NOT use PR_SET_PDEATHSIG - it can kill the parent when child is killed
     
+    // Close unused pipe ends
+    close(game->pipe_in[1]);
+    close(game->pipe_out[0]);
+    
+    // Set up signal handler for clean exit
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGINT, SIG_DFL);
+    
+    // Load the game library
+    void* handle = dlopen(game->path, RTLD_NOW);
+    if (!handle) {
+        game_shm_lock(game->shm);
+        snprintf(game->shm->error_msg, sizeof(game->shm->error_msg),
+                "Failed to load game: %s", dlerror());
+        game->shm->has_error = 1;
+        game->shm->ready = 1;
+        game_shm_unlock(game->shm);
+        exit(1);
+    }
+    
+    typedef Game* (*create_game_fn)();
     create_game_fn create = (create_game_fn)dlsym(handle, "create_game");
-    if (!create) { dlclose(handle); return 0; }
-    
-    Game* game = create();
-    if (!game) { dlclose(handle); return 0; }
-    
-    game->handle = handle;
-    strncpy(game->path, path, MAX_PATH-1);
-    
-    if (!game->init || !game->render || !game->update || !game->cleanup) {
+    if (!create) {
+        game_shm_lock(game->shm);
+        snprintf(game->shm->error_msg, sizeof(game->shm->error_msg),
+                "Game missing 'create_game' symbol");
+        game->shm->has_error = 1;
+        game->shm->ready = 1;
+        game_shm_unlock(game->shm);
         dlclose(handle);
+        exit(1);
+    }
+    
+    Game* game_obj = create();
+    if (!game_obj) {
+        game_shm_lock(game->shm);
+        snprintf(game->shm->error_msg, sizeof(game->shm->error_msg),
+                "Game 'create_game' returned NULL");
+        game->shm->has_error = 1;
+        game->shm->ready = 1;
+        game_shm_unlock(game->shm);
+        dlclose(handle);
+        exit(1);
+    }
+    
+    if (!game_obj->init || !game_obj->render || !game_obj->update || !game_obj->cleanup) {
+        game_shm_lock(game->shm);
+        snprintf(game->shm->error_msg, sizeof(game->shm->error_msg),
+                "Game missing required functions");
+        game->shm->has_error = 1;
+        game->shm->ready = 1;
+        game_shm_unlock(game->shm);
+        dlclose(handle);
+        exit(1);
+    }
+    
+    // Initialize and render first frame
+    game_obj->init(game_obj);
+    
+    Framebuffer fb;
+    memset(&fb, 0, sizeof(fb));
+    game_obj->update(game_obj);
+    game_obj->render(game_obj, &fb);
+    
+    game_shm_lock(game->shm);
+    memcpy(game->shm->framebuffer, fb.pixels, sizeof(fb.pixels));
+    game->shm->frame_ready = 1;
+    game->shm->ready = 1;
+    game->shm->running = 1;
+    game_shm_unlock(game->shm);
+    
+    // Main game loop
+    while (1) {
+        memset(&fb, 0, sizeof(fb));
+        
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(game->pipe_in[0], &rfds);
+        struct timeval tv = {0, 0};
+        
+        if (select(game->pipe_in[0] + 1, &rfds, NULL, NULL, &tv) > 0) {
+            char cmd;
+            int n = read(game->pipe_in[0], &cmd, 1);
+            if (n <= 0 || cmd == 'Q') break;
+            
+            if (cmd == 'I') {
+                int type, key_code, pressed, x, y;
+                if (read(game->pipe_in[0], &type, sizeof(int)) != sizeof(int)) break;
+                if (read(game->pipe_in[0], &key_code, sizeof(int)) != sizeof(int)) break;
+                if (read(game->pipe_in[0], &pressed, sizeof(int)) != sizeof(int)) break;
+                if (read(game->pipe_in[0], &x, sizeof(int)) != sizeof(int)) break;
+                if (read(game->pipe_in[0], &y, sizeof(int)) != sizeof(int)) break;
+                
+                if (type == 1 && game_obj->handle_key) {
+                    game_obj->handle_key(game_obj, key_code, pressed);
+                } else if (type == 2 && game_obj->handle_click) {
+                    game_obj->handle_click(game_obj, x, y);
+                }
+            }
+        }
+        
+        game_obj->update(game_obj);
+        game_obj->render(game_obj, &fb);
+        
+        game_shm_lock(game->shm);
+        memcpy(game->shm->framebuffer, fb.pixels, sizeof(fb.pixels));
+        game->shm->frame_ready = 1;
+        game_shm_unlock(game->shm);
+        
+        usleep(16667);
+    }
+    
+    game_obj->cleanup(game_obj);
+    dlclose(handle);
+    
+    game_shm_lock(game->shm);
+    game->shm->running = 0;
+    game_shm_unlock(game->shm);
+    
+    exit(0);
+}
+
+static void cleanup_game_resources(GameProcess* game) {
+    if (!game) return;
+    
+    // Close pipes
+    if (game->pipe_in[0] >= 0) { close(game->pipe_in[0]); game->pipe_in[0] = -1; }
+    if (game->pipe_in[1] >= 0) { close(game->pipe_in[1]); game->pipe_in[1] = -1; }
+    if (game->pipe_out[0] >= 0) { close(game->pipe_out[0]); game->pipe_out[0] = -1; }
+    if (game->pipe_out[1] >= 0) { close(game->pipe_out[1]); game->pipe_out[1] = -1; }
+    
+    // Cleanup shared memory
+    if (game->shm && game->shm != MAP_FAILED) {
+        munmap(game->shm, sizeof(GameSharedMemory));
+        game->shm = NULL;
+    }
+    
+    if (game->shm_fd >= 0) {
+        close(game->shm_fd);
+        game->shm_fd = -1;
+    }
+    
+    if (game->shm_name[0] != 0) {
+        shm_unlink(game->shm_name);
+        game->shm_name[0] = 0;
+    }
+    
+    game->active = 0;
+    game->pid = 0;
+    game->error_dialog = 0;
+}
+
+static int start_game_process(GameManager* gm, GameProcess* game) {
+    if (!game) return 0;
+    
+    // Clean up previous resources
+    cleanup_game_resources(game);
+    
+    // Reset state
+    game->has_error = 0;
+    game->error_msg[0] = 0;
+    game->error_dialog = 0;
+    game->error_dialog_button = -1;
+    
+    // Create unique shared memory name
+    snprintf(game->shm_name, sizeof(game->shm_name), "%s%d_%d_%d", 
+             GAME_SHM_PREFIX, getpid(), game->index, (int)time(NULL));
+    
+    shm_unlink(game->shm_name);
+    
+    game->shm_fd = shm_open(game->shm_name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (game->shm_fd < 0) {
+        snprintf(game->error_msg, sizeof(game->error_msg), 
+                "Failed to create shared memory: %s", strerror(errno));
+        game->has_error = 1;
+        game->error_time = time(NULL);
+        game->error_dialog = 1;
         return 0;
     }
     
-    if (gm->game_count < MAX_GAMES) {
+    if (ftruncate(game->shm_fd, sizeof(GameSharedMemory)) < 0) {
+        snprintf(game->error_msg, sizeof(game->error_msg), 
+                "Failed to resize shared memory: %s", strerror(errno));
+        game->has_error = 1;
+        game->error_time = time(NULL);
+        game->error_dialog = 1;
+        close(game->shm_fd);
+        shm_unlink(game->shm_name);
+        game->shm_fd = -1;
+        game->shm_name[0] = 0;
+        return 0;
+    }
+    
+    game->shm = mmap(NULL, sizeof(GameSharedMemory), PROT_READ | PROT_WRITE, 
+                     MAP_SHARED, game->shm_fd, 0);
+    if (game->shm == MAP_FAILED) {
+        snprintf(game->error_msg, sizeof(game->error_msg), 
+                "Failed to map shared memory: %s", strerror(errno));
+        game->has_error = 1;
+        game->error_time = time(NULL);
+        game->error_dialog = 1;
+        close(game->shm_fd);
+        shm_unlink(game->shm_name);
+        game->shm_fd = -1;
+        game->shm_name[0] = 0;
+        game->shm = NULL;
+        return 0;
+    }
+    
+    memset(game->shm, 0, sizeof(GameSharedMemory));
+    
+    // Create pipes
+    if (pipe(game->pipe_in) < 0 || pipe(game->pipe_out) < 0) {
+        snprintf(game->error_msg, sizeof(game->error_msg), 
+                "Failed to create pipes: %s", strerror(errno));
+        game->has_error = 1;
+        game->error_time = time(NULL);
+        game->error_dialog = 1;
+        cleanup_game_resources(game);
+        return 0;
+    }
+    
+    // Fork
+    game->pid = fork();
+    if (game->pid < 0) {
+        snprintf(game->error_msg, sizeof(game->error_msg), 
+                "Failed to fork: %s", strerror(errno));
+        game->has_error = 1;
+        game->error_time = time(NULL);
+        game->error_dialog = 1;
+        cleanup_game_resources(game);
+        return 0;
+    }
+    
+    if (game->pid == 0) {
+        // Child process
+        game_process_main(gm, game);
+        _exit(1);
+    }
+    
+    // Parent - close child's pipe ends
+    close(game->pipe_in[0]);
+    close(game->pipe_out[1]);
+    game->pipe_in[0] = -1;
+    game->pipe_out[1] = -1;
+    
+    // Wait for ready with timeout
+    time_t start = time(NULL);
+    while (1) {
+        int status;
+        pid_t result = waitpid(game->pid, &status, WNOHANG);
+        if (result > 0) {
+            snprintf(game->error_msg, sizeof(game->error_msg), 
+                    "Game process crashed during startup");
+            game->has_error = 1;
+            game->error_time = time(NULL);
+            game->pid = 0;
+            game->error_dialog = 1;
+            printf("Game crashed on startup\n");
+            return 0;
+        }
+        
+        game_shm_lock(game->shm);
+        int ready = game->shm->ready;
+        int has_error = game->shm->has_error;
+        if (has_error) {
+            strncpy(game->error_msg, game->shm->error_msg, sizeof(game->error_msg)-1);
+            game->error_msg[sizeof(game->error_msg)-1] = 0;
+        }
+        game_shm_unlock(game->shm);
+        
+        if (ready) {
+            if (has_error) {
+                game->has_error = 1;
+                game->error_time = time(NULL);
+                game->error_dialog = 1;
+                printf("Game failed to start: %s\n", game->error_msg);
+                kill(game->pid, SIGTERM);
+                waitpid(game->pid, &status, 0);
+                game->pid = 0;
+                return 0;
+            }
+            
+            game->active = 1;
+            game->has_error = 0;
+            game->error_dialog = 0;
+            printf("Game started successfully (PID: %d)\n", game->pid);
+            return 1;
+        }
+        
+        if (time(NULL) - start > 5) {
+            snprintf(game->error_msg, sizeof(game->error_msg), "Game startup timeout");
+            game->has_error = 1;
+            game->error_time = time(NULL);
+            game->error_dialog = 1;
+            kill(game->pid, SIGTERM);
+            waitpid(game->pid, &status, 0);
+            game->pid = 0;
+            return 0;
+        }
+        
+        usleep(10000);
+    }
+}
+
+static void stop_game_process(GameManager* gm, GameProcess* game) {
+    if (!game) return;
+    
+    if (game->pid > 0) {
+        // Try graceful stop
+        if (game->pipe_in[1] >= 0) {
+            char cmd = 'Q';
+            ssize_t ret __attribute__((unused));
+            ret = write(game->pipe_in[1], &cmd, 1);
+        }
+        
+        usleep(100000);
+        
+        int status;
+        if (waitpid(game->pid, &status, WNOHANG) == 0) {
+            kill(game->pid, SIGTERM);
+            usleep(100000);
+            
+            if (waitpid(game->pid, &status, WNOHANG) == 0) {
+                kill(game->pid, SIGKILL);
+                waitpid(game->pid, &status, 0);
+            }
+        }
+    }
+    
+    cleanup_game_resources(game);
+}
+
+static void send_input_to_game(GameManager* gm, GameProcess* game, int type, int key_code, int pressed, int x, int y) {
+    if (!game || !game->active || game->pid <= 0 || game->has_error) return;
+    if (game->pipe_in[1] < 0) return;
+    
+    int status;
+    if (waitpid(game->pid, &status, WNOHANG) != 0) {
+        return;
+    }
+    
+    ssize_t ret __attribute__((unused));
+    char cmd = 'I';
+    ret = write(game->pipe_in[1], &cmd, 1);
+    if (ret != 1) return;
+    ret = write(game->pipe_in[1], &type, sizeof(int));
+    if (ret != sizeof(int)) return;
+    ret = write(game->pipe_in[1], &key_code, sizeof(int));
+    if (ret != sizeof(int)) return;
+    ret = write(game->pipe_in[1], &pressed, sizeof(int));
+    if (ret != sizeof(int)) return;
+    ret = write(game->pipe_in[1], &x, sizeof(int));
+    if (ret != sizeof(int)) return;
+    ret = write(game->pipe_in[1], &y, sizeof(int));
+    if (ret != sizeof(int)) return;
+}
+
+static void check_game_processes(GameManager* gm) {
+    for (int i = 0; i < gm->game_count; i++) {
+        GameProcess* game = gm->games[i];
+        if (!game) continue;
+        if (!game->active || game->pid <= 0) continue;
+        
+        int status;
+        pid_t result = waitpid(game->pid, &status, WNOHANG);
+        if (result > 0) {
+            printf("Game process terminated (PID: %d)\n", game->pid);
+            
+            if (WIFEXITED(status)) {
+                snprintf(game->error_msg, sizeof(game->error_msg), 
+                        "Game exited with code %d", WEXITSTATUS(status));
+            } else if (WIFSIGNALED(status)) {
+                snprintf(game->error_msg, sizeof(game->error_msg), 
+                        "Game crashed: signal %d (%s)", WTERMSIG(status), strsignal(WTERMSIG(status)));
+            } else {
+                snprintf(game->error_msg, sizeof(game->error_msg), 
+                        "Game terminated unexpectedly");
+            }
+            
+            game->has_error = 1;
+            game->error_time = time(NULL);
+            game->error_dialog = 1;
+            game->active = 0;
+            game->pid = 0;
+            
+            // Close pipes but KEEP shared memory
+            if (game->pipe_in[0] >= 0) { close(game->pipe_in[0]); game->pipe_in[0] = -1; }
+            if (game->pipe_in[1] >= 0) { close(game->pipe_in[1]); game->pipe_in[1] = -1; }
+            if (game->pipe_out[0] >= 0) { close(game->pipe_out[0]); game->pipe_out[0] = -1; }
+            if (game->pipe_out[1] >= 0) { close(game->pipe_out[1]); game->pipe_out[1] = -1; }
+            
+            printf("Game error: %s\n", game->error_msg);
+        }
+    }
+}
+
+// =============================================================================
+// GAME LOADER
+// =============================================================================
+
+static int load_game_from_so(GameManager* gm, const char* path) {
+    if (gm->game_count >= MAX_GAMES) return 0;
+    
+    GameProcess* game = calloc(1, sizeof(GameProcess));
+    if (!game) return 0;
+    
+    strncpy(game->path, path, MAX_PATH-1);
+    game->path[MAX_PATH-1] = 0;
+    game->index = gm->game_count;
+    
+    game->pipe_in[0] = -1;
+    game->pipe_in[1] = -1;
+    game->pipe_out[0] = -1;
+    game->pipe_out[1] = -1;
+    game->shm_fd = -1;
+    game->pid = 0;
+    game->active = 0;
+    game->has_error = 0;
+    game->error_dialog = 0;
+    game->error_dialog_button = -1;
+    game->restart_count = 0;
+    game->shm = NULL;
+    game->shm_name[0] = 0;
+    
+    // Get game name
+    void* handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        snprintf(game->error_msg, sizeof(game->error_msg), "Cannot load library: %s", dlerror());
+        game->has_error = 1;
+        game->error_time = time(NULL);
+        game->error_dialog = 1;
+        strncpy(game->name, "Invalid Game", sizeof(game->name)-1);
         gm->games[gm->game_count++] = game;
-        printf("Loaded: %s\n", game->name);
-        return 1;
+        return 0;
+    }
+    
+    typedef Game* (*create_game_fn)();
+    create_game_fn create = (create_game_fn)dlsym(handle, "create_game");
+    if (!create) {
+        snprintf(game->error_msg, sizeof(game->error_msg), "Missing 'create_game' symbol");
+        game->has_error = 1;
+        game->error_time = time(NULL);
+        game->error_dialog = 1;
+        strncpy(game->name, "Bad Plugin", sizeof(game->name)-1);
+        dlclose(handle);
+        gm->games[gm->game_count++] = game;
+        return 0;
+    }
+    
+    Game* temp = create();
+    if (temp && temp->name[0]) {
+        strncpy(game->name, temp->name, sizeof(game->name)-1);
+        game->name[sizeof(game->name)-1] = 0;
+    } else {
+        const char* fname = strrchr(path, '/');
+        if (!fname) fname = path;
+        else fname++;
+        strncpy(game->name, fname, sizeof(game->name)-1);
+        game->name[sizeof(game->name)-1] = 0;
+        char* dot = strstr(game->name, ".so");
+        if (dot) *dot = 0;
     }
     
     dlclose(handle);
-    return 0;
+    
+    gm->games[gm->game_count++] = game;
+    
+    if (!start_game_process(gm, game)) {
+        printf("Game '%s' loaded with errors\n", game->name);
+    }
+    
+    return 1;
 }
 
 static void scan_games_directory(GameManager* gm, const char* dir_path) {
@@ -483,14 +1087,23 @@ static void scan_games_directory(GameManager* gm, const char* dir_path) {
 static void remove_game_instance(GameManager* gm, int index) {
     if (index < 0 || index >= gm->game_count) return;
     
-    printf("Removing: %s\n", gm->games[index]->name);
+    GameProcess* game = gm->games[index];
+    if (!game) return;
     
-    if (gm->games[index]->active && gm->games[index]->cleanup)
-        gm->games[index]->cleanup(gm->games[index]);
-    if (gm->games[index]->handle) dlclose(gm->games[index]->handle);
+    printf("Removing: %s\n", game->name);
     
-    for (int i = index; i < gm->game_count - 1; i++)
+    stop_game_process(gm, game);
+    free(game);
+    gm->games[index] = NULL;
+    
+    // Compact the array
+    for (int i = index; i < gm->game_count - 1; i++) {
         gm->games[i] = gm->games[i+1];
+        if (gm->games[i]) {
+            gm->games[i]->index = i;
+        }
+    }
+    gm->games[gm->game_count - 1] = NULL;
     gm->game_count--;
     
     if (gm->current_game >= gm->game_count)
@@ -507,29 +1120,40 @@ static void gm_render(GameManager* gm) {
     pthread_mutex_lock(&gm->fb_mutex);
     Framebuffer* fb = &gm->framebuffer;
     
+    // Engine UI background
     fb_fill(fb, 0, 0, MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT, 0x1A, 0x1A, 0x1A);
     
+    // Sidebar
     fb_fill(fb, 0, 0, SIDEBAR_WIDTH, MAIN_WINDOW_HEIGHT, 0x15, 0x15, 0x18);
     fb_text_center(fb, 0, 15, SIDEBAR_WIDTH, "SPANE ENGINE", 0x00, 0xCC, 0xFF);
     fb_fill(fb, 10, 35, SIDEBAR_WIDTH-20, 2, 0x00, 0x88, 0xCC);
     
     int by = 55;
     for (int i = 0; i < gm->game_count; i++) {
+        GameProcess* gp = gm->games[i];
+        if (!gp) continue;
+        
         int act = (i == gm->current_game);
         int hov = (i == gm->hover_button);
-        unsigned char r, g, b;
+        unsigned char sr, sg, sb;  // Fixed: renamed from r, g, b to avoid conflict with gp
         
-        if (act) { r = 0x00; g = 0x88; b = 0xCC; }
-        else if (hov) { r = 0xCC; g = 0x88; b = 0x00; }
-        else { r = 0x25; g = 0x25; b = 0x2A; }
+        if (gp->has_error) { sr = 0x88; sg = 0x22; sb = 0x22; }
+        else if (act) { sr = 0x00; sg = 0x88; sb = 0xCC; }
+        else if (hov) { sr = 0xCC; sg = 0x88; sb = 0x00; }
+        else { sr = 0x25; sg = 0x25; sb = 0x2A; }
         
-        fb_fill(fb, 10, by, SIDEBAR_WIDTH-35, 35, r, g, b);
-        fb_rect(fb, 10, by, SIDEBAR_WIDTH-35, 35, act ? 0x00:0x44, act ? 0xCC:0x44, act ? 0xFF:0x44);
-        fb_text_center(fb, 10, by+12, SIDEBAR_WIDTH-35, gm->games[i]->name, 0xFF, 0xFF, 0xFF);
+        fb_fill(fb, 10, by, SIDEBAR_WIDTH-35, 35, sr, sg, sb);
+        fb_rect(fb, 10, by, SIDEBAR_WIDTH-35, 35, 
+                gp->has_error ? 0xFF : (act ? 0x00:0x44),
+                gp->has_error ? 0x44 : (act ? 0xCC:0x44),
+                gp->has_error ? 0x44 : (act ? 0xFF:0x44));
+        fb_text_center(fb, 10, by+12, SIDEBAR_WIDTH-35, gp->name, 0xFF, 0xFF, 0xFF);
         
-        int cx = SIDEBAR_WIDTH - 22;
-        fb_fill(fb, cx, by, 18, 18, 0x88, 0x22, 0x22);
-        fb_text_center(fb, cx, by+4, 18, "X", 0xFF, 0xFF, 0xFF);
+        // X button
+        int cx = SIDEBAR_WIDTH - 30;
+        fb_fill(fb, cx, by + 8, 16, 16, 0x88, 0x22, 0x22);
+        fb_rect(fb, cx, by + 8, 16, 16, 0xFF, 0x44, 0x44);
+        fb_text(fb, cx + 4, by + 12, "X", 0xFF, 0xFF, 0xFF);
         
         by += 45;
     }
@@ -549,50 +1173,117 @@ static void gm_render(GameManager* gm) {
              gm->web_mode ? "WEB" : "X11");
     fb_text(fb, 10, MAIN_WINDOW_HEIGHT - 25, info, 0x88, 0x88, 0x88);
     
-    for (int t = 0; t < 2; t++)
-        fb_rect(fb, GAME_AREA_X-t-1, GAME_AREA_Y-t-1, GAME_AREA_WIDTH+2*t+2, GAME_AREA_HEIGHT+2*t+2, 0x44, 0x44, 0x55);
+    // Game area border
+    fb_rect(fb, GAME_AREA_X-1, GAME_AREA_Y-1, GAME_AREA_WIDTH+2, GAME_AREA_HEIGHT+2, 0x44, 0x44, 0x55);
+    fb_rect(fb, GAME_AREA_X-2, GAME_AREA_Y-2, GAME_AREA_WIDTH+4, GAME_AREA_HEIGHT+4, 0x44, 0x44, 0x55);
     
-    for (int i = 0; i < gm->game_count; i++) {
-        if (gm->games[i]->active && gm->games[i]->render && i == gm->current_game) {
-            char lb[128];
-            snprintf(lb, sizeof(lb), "Game: %s", gm->games[i]->name);
-            fb_text(fb, GAME_AREA_X, GAME_AREA_Y-15, lb, 0xCC, 0xCC, 0xCC);
-            gm->games[i]->render(gm->games[i], fb);
+    // Render current game
+    if (gm->current_game >= 0 && gm->current_game < gm->game_count) {
+        GameProcess* game = gm->games[gm->current_game];
+        if (!game) goto no_game;
+        
+        // Copy game framebuffer if available
+        if (game->shm) {
+            game_shm_lock(game->shm);
+            if (game->shm->frame_ready) {
+                for (int gy = 0; gy < GAME_AREA_HEIGHT; gy++) {
+                    for (int gx = 0; gx < GAME_AREA_WIDTH; gx++) {
+                        int src_idx = ((gy + GAME_AREA_Y) * MAIN_WINDOW_WIDTH + (gx + GAME_AREA_X)) * 4;
+                        int dst_idx = src_idx;
+                        fb->pixels[dst_idx] = game->shm->framebuffer[src_idx];
+                        fb->pixels[dst_idx + 1] = game->shm->framebuffer[src_idx + 1];
+                        fb->pixels[dst_idx + 2] = game->shm->framebuffer[src_idx + 2];
+                        fb->pixels[dst_idx + 3] = 255;
+                    }
+                }
+            }
+            game_shm_unlock(game->shm);
         }
-    }
-    
-    if (gm->game_count == 0) {
-        fb_text_center(fb, GAME_AREA_X, GAME_AREA_Y + GAME_AREA_HEIGHT/2, GAME_AREA_WIDTH,
-                       "Click [Load Game] to add a game", 0x66, 0x66, 0x66);
+        
+        // Game label
+        char lb[128];
+        snprintf(lb, sizeof(lb), "Game: %s%s", game->name, 
+                game->has_error ? " [CRASHED]" : (game->active ? "" : " [LOADING]"));
+        fb_text(fb, GAME_AREA_X, GAME_AREA_Y-15, lb, 
+                game->has_error ? 0xFF : 0xCC, 
+                game->has_error ? 0x44 : 0xCC, 
+                game->has_error ? 0x44 : 0xCC);
+        
+        // Show error dialog if game crashed
+        if (game->error_dialog && game->has_error) {
+            render_error_dialog(fb, game, gm);
+        }
+    } else {
+no_game:
+        if (gm->game_count == 0) {
+            fb_text_center(fb, GAME_AREA_X, GAME_AREA_Y + GAME_AREA_HEIGHT/2, GAME_AREA_WIDTH,
+                           "Click [Load Game] to add a game", 0x66, 0x66, 0x66);
+        }
     }
     
     pthread_mutex_unlock(&gm->fb_mutex);
 }
 
 static void gm_switch(GameManager* gm, int i) {
-    if (i >= 0 && i < gm->game_count) {
+    if (i >= 0 && i < gm->game_count && gm->games[i]) {
         gm->current_game = i;
         sync_to_shared(gm);
     }
 }
 
 static void gm_click(GameManager* gm, int x, int y) {
+    // Check error dialog buttons first
+    if (gm->current_game >= 0 && gm->current_game < gm->game_count) {
+        GameProcess* game = gm->games[gm->current_game];
+        if (game && game->error_dialog && game->has_error) {
+            int dx = GAME_AREA_X + 100;
+            int dy = GAME_AREA_Y + 150;
+            int dw = GAME_AREA_WIDTH - 200;
+            int dh = 300;
+            int btn_w = 180;
+            int btn_h = 40;
+            int btn_y = dy + dh - 70;
+            int restart_x = dx + (dw/2) - btn_w - 20;
+            int close_x = dx + (dw/2) + 20;
+            
+            if (x >= restart_x && x < restart_x + btn_w &&
+                y >= btn_y && y < btn_y + btn_h) {
+                printf("Restarting game '%s'...\n", game->name);
+                game->restart_count++;
+                game->has_error = 0;
+                game->error_msg[0] = 0;
+                game->error_dialog = 0;
+                game->error_dialog_button = -1;
+                start_game_process(gm, game);
+                return;
+            }
+            
+            if (x >= close_x && x < close_x + btn_w &&
+                y >= btn_y && y < btn_y + btn_h) {
+                printf("Closing game '%s'\n", game->name);
+                remove_game_instance(gm, gm->current_game);
+                return;
+            }
+            return; // Click elsewhere on dialog - ignore
+        }
+    }
+    
     int lby = MAIN_WINDOW_HEIGHT - 110;
     
+    // Load Game button
     if (x >= 10 && x < SIDEBAR_WIDTH-10) {
         if (y >= lby && y < lby+28) {
+            printf("Load Game button clicked\n");
             int ret __attribute__((unused));
             ret = system("zenity --file-selection --title=\"Select Game .so file\" "
-                         "--file-filter=\"Shared Objects (*.so) | *.so\" "
-                         "> /tmp/spane_load.txt 2>/dev/null");
+                   "--file-filter=\"Shared Objects (*.so) | *.so\" "
+                   "> /tmp/spane_load.txt 2>/dev/null");
             FILE* f = fopen("/tmp/spane_load.txt", "r");
             if (f) {
                 char path[MAX_PATH];
                 if (fgets(path, sizeof(path), f)) {
                     path[strcspn(path, "\n")] = 0;
                     if (strlen(path) > 0 && load_game_from_so(gm, path)) {
-                        Game* g = gm->games[gm->game_count - 1];
-                        if (g->init) g->init(g);
                         gm->current_game = gm->game_count - 1;
                         sync_to_shared(gm);
                         save_disk_backup(gm);
@@ -604,11 +1295,15 @@ static void gm_click(GameManager* gm, int x, int y) {
             return;
         }
         
+        // Clear All button
         if (y >= lby+33 && y < lby+61) {
+            printf("Clear All button clicked\n");
             for (int i = 0; i < gm->game_count; i++) {
-                if (gm->games[i]->active && gm->games[i]->cleanup)
-                    gm->games[i]->cleanup(gm->games[i]);
-                if (gm->games[i]->handle) dlclose(gm->games[i]->handle);
+                if (gm->games[i]) {
+                    stop_game_process(gm, gm->games[i]);
+                    free(gm->games[i]);
+                    gm->games[i] = NULL;
+                }
             }
             gm->game_count = 0;
             gm->current_game = -1;
@@ -617,24 +1312,34 @@ static void gm_click(GameManager* gm, int x, int y) {
         }
     }
     
+    // Sidebar game list
     if (x < SIDEBAR_WIDTH) {
         int by = 55;
         for (int i = 0; i < gm->game_count; i++) {
-            int cx = SIDEBAR_WIDTH - 22;
-            if (x >= cx && x < cx+18 && y >= by && y < by+18) {
+            GameProcess* gp = gm->games[i];
+            if (!gp) { by += 45; continue; }
+            
+            int cx = SIDEBAR_WIDTH - 30;
+            // X button
+            if (x >= cx && x < cx+16 && y >= by+8 && y < by+24) {
+                printf("X button clicked for game: %s\n", gp->name);
                 remove_game_instance(gm, i);
                 return;
             }
+            // Game selection
             if (y >= by && y < by+35 && x >= 10 && x < cx-2) {
                 gm_switch(gm, i);
                 return;
             }
             by += 45;
         }
-    } else if (gm->game_count > 0 && gm->current_game < gm->game_count 
-               && gm->games[gm->current_game]->active
-               && gm->games[gm->current_game]->handle_click) {
-        gm->games[gm->current_game]->handle_click(gm->games[gm->current_game], x, y);
+    }
+    // Game area click - only send to active, non-errored game
+    else if (gm->current_game >= 0 && gm->current_game < gm->game_count) {
+        GameProcess* game = gm->games[gm->current_game];
+        if (game && game->active && !game->has_error && !game->error_dialog) {
+            send_input_to_game(gm, game, 2, 0, 0, x, y);
+        }
     }
 }
 
@@ -672,10 +1377,15 @@ static int x11_init(GameManager* gm) {
     gm->display = XOpenDisplay(NULL);
     if (!gm->display) return 0;
     
+    gm->wm_delete_window = XInternAtom(gm->display, "WM_DELETE_WINDOW", False);
+    
     int s = DefaultScreen(gm->display);
     gm->window = XCreateSimpleWindow(gm->display, RootWindow(gm->display, s),
                                      50, 50, MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT, 1,
                                      BlackPixel(gm->display, s), 0x1A1A1A);
+    
+    XSetWMProtocols(gm->display, gm->window, &gm->wm_delete_window, 1);
+    
     XSelectInput(gm->display, gm->window,
                  ExposureMask | KeyPressMask | KeyReleaseMask | ButtonPressMask | 
                  ButtonReleaseMask | PointerMotionMask | StructureNotifyMask);
@@ -694,17 +1404,12 @@ static int x11_init(GameManager* gm) {
 }
 
 static int x11_to_keycode(KeySym ks) {
-    // Function keys
     if (ks == XK_Escape) return 27;
     if (ks >= XK_F1 && ks <= XK_F12) return 111 + (ks - XK_F1);
-    
-    // Cursor keys
     if (ks == XK_Up || ks == XK_w || ks == XK_W) return 38;
     if (ks == XK_Down || ks == XK_s || ks == XK_S) return 40;
     if (ks == XK_Left || ks == XK_a || ks == XK_A) return 37;
     if (ks == XK_Right || ks == XK_d || ks == XK_D) return 39;
-    
-    // Modifier/action keys
     if (ks == XK_Return || ks == XK_KP_Enter) return 13;
     if (ks == XK_space || ks == XK_KP_Space) return 32;
     if (ks == XK_BackSpace) return 8;
@@ -712,25 +1417,16 @@ static int x11_to_keycode(KeySym ks) {
     if (ks == XK_Tab) return 9;
     if (ks == XK_Shift_L || ks == XK_Shift_R) return 16;
     if (ks == XK_Control_L || ks == XK_Control_R) return 17;
-    
-    // Alphanumeric keys (A-Z)
     if (ks >= XK_A && ks <= XK_Z) return 'A' + (ks - XK_A);
     if (ks >= XK_a && ks <= XK_z) return 'A' + (ks - XK_a);
-    
-    // Main keyboard numbers (0-9)
     if (ks >= XK_0 && ks <= XK_9) return '0' + (ks - XK_0);
-    
-    // Keypad numbers
     if (ks >= XK_KP_0 && ks <= XK_KP_9) return '0' + (ks - XK_KP_0);
-    
-    // Keypad operators
     if (ks == XK_KP_Add) return '+';
     if (ks == XK_KP_Subtract) return '-';
     if (ks == XK_KP_Multiply) return '*';
     if (ks == XK_KP_Divide) return '/';
     if (ks == XK_KP_Decimal) return '.';
-    
-    return 0;  // Unknown key
+    return 0;
 }
 
 static void x11_process(GameManager* gm, int* running) {
@@ -738,20 +1434,31 @@ static void x11_process(GameManager* gm, int* running) {
         XEvent e;
         XNextEvent(gm->display, &e);
         
+        // Handle window close properly
+        if (e.type == ClientMessage) {
+            if ((Atom)e.xclient.data.l[0] == gm->wm_delete_window) {
+                printf("Window close requested via WM\n");
+                *running = 0;
+                return;
+            }
+        }
+        
         if (e.type == KeyPress) {
             int k = x11_to_keycode(XLookupKeysym(&e.xkey, 0));
             if (k >= 112 && k <= 115) gm_switch(gm, k - 112);
-            else if (gm->game_count > 0 && gm->current_game < gm->game_count 
-                     && gm->games[gm->current_game]->active
-                     && gm->games[gm->current_game]->handle_key)
-                gm->games[gm->current_game]->handle_key(gm->games[gm->current_game], k, 1);
+            else if (gm->current_game >= 0 && gm->current_game < gm->game_count) {
+                GameProcess* game = gm->games[gm->current_game];
+                if (game && game->active && !game->has_error && !game->error_dialog)
+                    send_input_to_game(gm, game, 1, k, 1, 0, 0);
+            }
         }
         else if (e.type == KeyRelease) {
             int k = x11_to_keycode(XLookupKeysym(&e.xkey, 0));
-            if (k && gm->game_count > 0 && gm->current_game < gm->game_count 
-                && gm->games[gm->current_game]->active
-                && gm->games[gm->current_game]->handle_key)
-                gm->games[gm->current_game]->handle_key(gm->games[gm->current_game], k, 0);
+            if (k && gm->current_game >= 0 && gm->current_game < gm->game_count) {
+                GameProcess* game = gm->games[gm->current_game];
+                if (game && game->active && !game->has_error && !game->error_dialog)
+                    send_input_to_game(gm, game, 1, k, 0, 0, 0);
+            }
         }
         else if (e.type == ButtonPress) {
             gm_click(gm, e.xbutton.x, e.xbutton.y);
@@ -760,11 +1467,39 @@ static void x11_process(GameManager* gm, int* running) {
             gm->mouse_x = e.xmotion.x;
             gm->mouse_y = e.xmotion.y;
             gm->hover_button = -1;
+            
+            // Hover tracking for error dialog buttons
+            if (gm->current_game >= 0 && gm->current_game < gm->game_count) {
+                GameProcess* game = gm->games[gm->current_game];
+                if (game && game->error_dialog && game->has_error) {
+                    int dx = GAME_AREA_X + 100;
+                    int dy = GAME_AREA_Y + 150;
+                    int dw = GAME_AREA_WIDTH - 200;
+                    int dh = 300;
+                    int btn_w = 180;
+                    int btn_h = 40;
+                    int btn_y = dy + dh - 70;
+                    int restart_x = dx + (dw/2) - btn_w - 20;
+                    int close_x = dx + (dw/2) + 20;
+                    
+                    if (e.xmotion.x >= restart_x && e.xmotion.x < restart_x + btn_w &&
+                        e.xmotion.y >= btn_y && e.xmotion.y < btn_y + btn_h) {
+                        game->error_dialog_button = 0;
+                    } else if (e.xmotion.x >= close_x && e.xmotion.x < close_x + btn_w &&
+                               e.xmotion.y >= btn_y && e.xmotion.y < btn_y + btn_h) {
+                        game->error_dialog_button = 1;
+                    } else {
+                        game->error_dialog_button = -1;
+                    }
+                }
+            }
+            
+            // Sidebar hover
             if (e.xmotion.x < SIDEBAR_WIDTH) {
                 int by = 55;
                 for (int i = 0; i < gm->game_count; i++) {
                     if (e.xmotion.y >= by && e.xmotion.y < by+35 
-                        && e.xmotion.x >= 10 && e.xmotion.x < SIDEBAR_WIDTH-25) {
+                        && e.xmotion.x >= 10 && e.xmotion.x < SIDEBAR_WIDTH-32) {
                         gm->hover_button = i;
                         break;
                     }
@@ -776,10 +1511,10 @@ static void x11_process(GameManager* gm, int* running) {
 }
 
 static void x11_cleanup(GameManager* gm) {
-    if (gm->ximage) { free(gm->ximage->data); gm->ximage->data = NULL; XDestroyImage(gm->ximage); }
-    if (gm->gc) XFreeGC(gm->display, gm->gc);
-    if (gm->window) XDestroyWindow(gm->display, gm->window);
-    if (gm->display) XCloseDisplay(gm->display);
+    if (gm->ximage) { free(gm->ximage->data); gm->ximage->data = NULL; XDestroyImage(gm->ximage); gm->ximage = NULL; }
+    if (gm->gc) { XFreeGC(gm->display, gm->gc); gm->gc = NULL; }
+    if (gm->window) { XDestroyWindow(gm->display, gm->window); gm->window = 0; }
+    if (gm->display) { XCloseDisplay(gm->display); gm->display = NULL; }
 }
 
 // =============================================================================
@@ -864,13 +1599,37 @@ static void whandle(WebServer* w, int cf) {
         if (strcmp(t, "m") == 0) {
             w->gm->mouse_x = x;
             w->gm->mouse_y = y;
-            // Add hover detection - same logic as X11 version
             w->gm->hover_button = -1;
+            
+            if (w->gm->current_game >= 0 && w->gm->current_game < w->gm->game_count) {
+                GameProcess* game = w->gm->games[w->gm->current_game];
+                if (game && game->error_dialog && game->has_error) {
+                    int dx = GAME_AREA_X + 100;
+                    int dy = GAME_AREA_Y + 150;
+                    int dw = GAME_AREA_WIDTH - 200;
+                    int dh = 300;
+                    int btn_w = 180;
+                    int btn_h = 40;
+                    int btn_y = dy + dh - 70;
+                    int restart_x = dx + (dw/2) - btn_w - 20;
+                    int close_x = dx + (dw/2) + 20;
+                    
+                    if (x >= restart_x && x < restart_x + btn_w &&
+                        y >= btn_y && y < btn_y + btn_h) {
+                        game->error_dialog_button = 0;
+                    } else if (x >= close_x && x < close_x + btn_w &&
+                               y >= btn_y && y < btn_y + btn_h) {
+                        game->error_dialog_button = 1;
+                    } else {
+                        game->error_dialog_button = -1;
+                    }
+                }
+            }
+            
             if (x < SIDEBAR_WIDTH) {
                 int by = 55;
                 for (int i = 0; i < w->gm->game_count; i++) {
-                    if (y >= by && y < by+35 
-                        && x >= 10 && x < SIDEBAR_WIDTH-25) {
+                    if (y >= by && y < by+35 && x >= 10 && x < SIDEBAR_WIDTH-32) {
                         w->gm->hover_button = i;
                         break;
                     }
@@ -885,10 +1644,11 @@ static void whandle(WebServer* w, int cf) {
             int pr = (t[1] == 'd');
             if (k == 27) w->run = 0;
             else if (k >= 112 && k <= 115 && pr) gm_switch(w->gm, k - 112);
-            else if (w->gm->game_count > 0 && w->gm->current_game < w->gm->game_count 
-                     && w->gm->games[w->gm->current_game]->active
-                     && w->gm->games[w->gm->current_game]->handle_key)
-                w->gm->games[w->gm->current_game]->handle_key(w->gm->games[w->gm->current_game], k, pr);
+            else if (w->gm->current_game >= 0 && w->gm->current_game < w->gm->game_count) {
+                GameProcess* game = w->gm->games[w->gm->current_game];
+                if (game && game->active && !game->has_error && !game->error_dialog)
+                    send_input_to_game(w->gm, game, 1, k, pr, 0, 0);
+            }
         }
         pthread_mutex_unlock(&w->gm->fb_mutex);
         send(cf, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK", 40, 0);
@@ -945,11 +1705,15 @@ static void* wthread(void* a) {
 // =============================================================================
 
 int main(int argc, char** argv) {
+    signal(SIGCHLD, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);  // Ignore broken pipe signals
+    
     GameManager gm;
     memset(&gm, 0, sizeof(gm));
     pthread_mutex_init(&gm.fb_mutex, NULL);
     gm.current_game = -1;
     gm.shm_fd = -1;
+    gm.wm_delete_window = 0;
     
     int web = 0, clear_state = 0;
     for (int i = 1; i < argc; i++) {
@@ -970,7 +1734,6 @@ int main(int argc, char** argv) {
         return 0;
     }
     
-    // Try X11 first, fallback to web
     int has_x11 = 0;
     if (!web) {
         has_x11 = x11_init(&gm);
@@ -982,19 +1745,18 @@ int main(int argc, char** argv) {
     
     gm.web_mode = web;
     
-    // Start web server if in web mode
     if (web) {
         ws.gm = &gm;
         pthread_create(&ws.th, NULL, wthread, &ws);
-        usleep(500000); // Wait for server to start
+        usleep(500000);
     }
     
     printf("SPANE Engine - Instance #%d (%s)\n", gm.instance_id + 1, web ? "Web" : "X11");
+    printf("Process isolation: ENABLED\n");
     
     srand(time(NULL));
     gm.last_fps_update = time(NULL);
     
-    // Load state
     if (!load_disk_backup(&gm)) {
         scan_games_directory(&gm, "./games");
     }
@@ -1002,9 +1764,6 @@ int main(int argc, char** argv) {
     
     if (gm.game_count > 0) {
         gm.current_game = 0;
-        for (int i = 0; i < gm.game_count; i++) {
-            if (gm.games[i]->init) gm.games[i]->init(gm.games[i]);
-        }
         sync_to_shared(&gm);
     }
     
@@ -1015,11 +1774,7 @@ int main(int argc, char** argv) {
         if (has_x11) x11_process(&gm, &running);
         if (web && !ws.run) running = 0;
         
-        // Update ALL games
-        for (int i = 0; i < gm.game_count; i++) {
-            if (gm.games[i]->active && gm.games[i]->update)
-                gm.games[i]->update(gm.games[i]);
-        }
+        check_game_processes(&gm);
         
         gm_render(&gm);
         if (has_x11) x11_mirror_frame(&gm);
@@ -1041,10 +1796,13 @@ int main(int argc, char** argv) {
     save_disk_backup(&gm);
     
     for (int i = 0; i < gm.game_count; i++) {
-        if (gm.games[i]->active && gm.games[i]->cleanup)
-            gm.games[i]->cleanup(gm.games[i]);
-        if (gm.games[i]->handle) dlclose(gm.games[i]->handle);
+        if (gm.games[i]) {
+            stop_game_process(&gm, gm.games[i]);
+            free(gm.games[i]);
+            gm.games[i] = NULL;
+        }
     }
+    
     if (has_x11) x11_cleanup(&gm);
     if (web) {
         ws.run = 0;
