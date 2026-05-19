@@ -242,6 +242,7 @@ typedef unsigned long Window;
 typedef unsigned long GC;
 typedef unsigned long KeySym;
 typedef unsigned long Visual;
+typedef unsigned long Atom;
 typedef struct _XDisplay Display;
 typedef struct _XImage XImage;
 typedef struct { int type; int x, y; int xbutton_button; int xmotion_x, xmotion_y; int xkey_keycode; } XEvent;
@@ -318,7 +319,7 @@ HEADER
     # Now copy the original file, skipping X11 includes and X11 function bodies
     # Use sed to delete lines between markers
     sed \
-        -e '/^#include <X11\//d' \
+        -e '/#include <X11\//d' \
         -e '/^\/\/ Compile:.*-lX11/d' \
         -e '/^\/\/ Run:.*\[--web\]/d' \
         -e '/^\/\/ Games are loaded/d' \
