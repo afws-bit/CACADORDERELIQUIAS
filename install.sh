@@ -213,6 +213,144 @@ has_x11() {
     [ -f "/usr/include/X11/Xlib.h" ] || [ -f "/usr/local/include/X11/Xlib.h" ]
 }
 
+# =============================================================================
+# GAMEDATA PRESERVATION FUNCTIONS
+# =============================================================================
+
+# Find and backup all gamedata directories recursively
+backup_gamedata_dirs() {
+    local search_dir="$1"
+    local backup_root="$2"
+    
+    log_message "Searching for gamedata directories in $search_dir..."
+    
+    if [ ! -d "$search_dir" ]; then
+        log_message "No existing installation found at $search_dir"
+        return 0
+    fi
+    
+    # Create backup directory structure
+    mkdir -p "$backup_root"
+    
+    # Find all directories named "gamedata" recursively
+    local count=0
+    find "$search_dir" -type d -name "gamedata" | while read -r gamedata_path; do
+        # Calculate relative path from INSTALL_DIR
+        local rel_path="${gamedata_path#$search_dir/}"
+        local backup_path="$backup_root/$rel_path"
+        
+        log_message "  Found: $rel_path"
+        
+        # Create parent directory structure
+        mkdir -p "$(dirname "$backup_path")"
+        
+        # Copy the entire gamedata directory
+        if cp -a "$gamedata_path" "$backup_path" 2>/dev/null; then
+            count=$((count + 1))
+            log_message "  ✓ Backed up to: $backup_path"
+        else
+            log_message "  ⚠ Failed to backup: $rel_path"
+        fi
+    done
+    
+    # Check if any gamedata dirs were found
+    if [ -z "$(ls -A "$backup_root" 2>/dev/null)" ]; then
+        log_message "No gamedata directories found"
+        return 1
+    fi
+    
+    log_message "✓ Gamedata backup complete"
+    return 0
+}
+
+# Restore gamedata directories after installation
+restore_gamedata_dirs() {
+    local backup_root="$1"
+    local target_dir="$2"
+    
+    if [ ! -d "$backup_root" ] || [ -z "$(ls -A "$backup_root" 2>/dev/null)" ]; then
+        return 1
+    fi
+    
+    log_message "Restoring gamedata directories..."
+    
+    find "$backup_root" -type d -name "gamedata" | while read -r backup_gamedata; do
+        # Calculate relative path from backup root
+        local rel_path="${backup_gamedata#$backup_root/}"
+        local target_path="$target_dir/$rel_path"
+        
+        log_message "  Restoring: $rel_path"
+        
+        # Create parent directories if needed
+        mkdir -p "$(dirname "$target_path")"
+        
+        # Copy back the gamedata
+        if cp -a "$backup_gamedata" "$target_path" 2>/dev/null; then
+            log_message "  ✓ Restored to: $target_path"
+        else
+            log_message "  ⚠ Failed to restore: $rel_path"
+        fi
+    done
+    
+    log_message "✓ Gamedata restore complete"
+}
+
+# Main update function that preserves gamedata
+perform_update() {
+    log_message "Starting update process..."
+    
+    # Create temporary directory for gamedata backup
+    local gamedata_backup="/tmp/spane_gamedata_backup_$$"
+    mkdir -p "$gamedata_backup"
+    
+    # Step 1: Backup all gamedata directories
+    log_message "Backing up gamedata directories..."
+    backup_gamedata_dirs "$INSTALL_DIR" "$gamedata_backup"
+    
+    # Step 2: Remove old installation but keep a copy of gamedata backup
+    log_message "Removing old installation..."
+    $SUDO rm -rf "$INSTALL_DIR"
+    [ -L "$BIN_DIR/$BINARY_NAME" ] && $SUDO rm -f "$BIN_DIR/$BINARY_NAME"
+    
+    # Step 3: Perform new installation
+    log_message "Installing new version..."
+    
+    rm -rf "$BUILD_DIR"
+    mkdir -p "$BUILD_DIR"
+    
+    src="$MAIN_SOURCE_DIR/$MAIN_FILE"
+    if [ ! -f "$src" ]; then
+        src=$(find "$MAIN_SOURCE_DIR" -maxdepth 1 -name "*.c" -exec grep -l "int main" {} \; | head -1)
+    fi
+    
+    if [ ! -f "$src" ]; then
+        log_message "Error: No Spane.c found"
+        rm -rf "$gamedata_backup"
+        exit 1
+    fi
+    
+    log_message "Source: $src"
+    
+    if compile_engine "$src"; then
+        compile_games
+        install_spane
+        
+        # Step 4: Restore all gamedata directories
+        restore_gamedata_dirs "$gamedata_backup" "$INSTALL_DIR"
+        
+        # Clean up backup
+        rm -rf "$gamedata_backup"
+        
+        cleanup
+        log_message "✓ Update complete - gamedata preserved"
+        return 0
+    else
+        log_message "✗ Compilation failed - gamedata backup preserved at: $gamedata_backup"
+        log_message "  Manual restore: cp -a $gamedata_backup/* $INSTALL_DIR/"
+        return 1
+    fi
+}
+
 # Use sed to replace all X11-specific code in one pass
 create_web_source() {
     local src="$1"
@@ -478,7 +616,31 @@ if [ -d "$INSTALL_DIR" ]; then
     printf "[1]=Update [2]=Remove [3]=Exit: "
     read choice
     case "$choice" in
-        1) $SUDO rm -rf "$INSTALL_DIR"; [ -L "$BIN_DIR/$BINARY_NAME" ] && $SUDO rm -f "$BIN_DIR/$BINARY_NAME" ;;
+        1) 
+            # Perform update with gamedata preservation
+            install_build_tools
+            install_zenity
+            
+            if [ "$WEB_MODE" = false ]; then
+                install_x11_libs
+            fi
+            
+            perform_update
+            
+            games=$(ls "$GAMES_DIR"/*.so 2>/dev/null | wc -l)
+            
+            echo ""
+            echo "╔════════════════════════════════╗"
+            echo "║    Update Complete!            ║"
+            echo "║                                ║"
+            echo "║  ✓ Gamedata preserved          ║"
+            has_x11 && echo "║  spane          X11 mode       ║"
+            echo "║  spane --web    Web mode       ║"
+            echo "║  Games: $games                    ║"
+            echo "╚════════════════════════════════╝"
+            echo ""
+            exit 0
+            ;;
         2) uninstall_spane; exit 0 ;;
         *) exit 0 ;;
     esac

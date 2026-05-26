@@ -26,7 +26,7 @@
 #define MAX_GUESS 100
 #define MAX_GUESSES 20
 #define MAX_SCORES 100
-#define HISTORY_FILE "guessing_history.txt"
+#define HISTORY_FILE "gamedata/guessing_history.txt"
 
 // Keycodes do SPANE
 #define KEY_UP      38
@@ -267,9 +267,20 @@ static double rec_sum_sq(int* arr, int n, double mean) {
 // =============================================================================
 // Histórico e Arquivo
 // =============================================================================
+// =============================================================================
+// Histórico e Arquivo
+// =============================================================================
 static void save_session(GuessingData* d) {
     if (!d) return;
-    FILE* f = fopen(HISTORY_FILE, "a");
+    
+    // Criar diretório gamedata/ se não existir
+    #ifdef _WIN32
+        system("if not exist gamedata mkdir gamedata");
+    #else
+        system("mkdir -p gamedata");
+    #endif
+    
+    FILE* f = fopen("gamedata/guessing_history.txt", "a");
     if (!f) return;
     time_t now = time(NULL);
     fprintf(f, "%ld %d %d", (long)now, d->target, d->num_guesses);
@@ -283,7 +294,7 @@ static void load_history(GuessingData* d) {
     num_sessions = 0;
     if (d) d->history_scroll = 0;
     
-    FILE* f = fopen(HISTORY_FILE, "r");
+    FILE* f = fopen("gamedata/guessing_history.txt", "r");
     if (!f) return;
     
     char line[2048];
